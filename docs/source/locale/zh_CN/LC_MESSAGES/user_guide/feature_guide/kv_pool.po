@@ -9,7 +9,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vllm-ascend\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-04 01:39+0000\n"
+"POT-Creation-Date: 2026-08-05 06:27+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: zh_CN <LL@li.org>\n"
@@ -236,8 +236,8 @@ msgid ""
 msgstr "确保环境中存在hccn.conf文件。如果使用Docker，请将其挂载到容器中。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:64
-msgid "For A5 series, additionally mount:"
-msgstr "对于A5系列，额外挂载："
+msgid "For Ascend 950 Products, additionally mount:"
+msgstr "对于Ascend 950产品，额外挂载："
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:65
 msgid "devices: `/dev/ummu`, `/dev/uburma`"
@@ -285,8 +285,8 @@ msgid "Export Command"
 msgstr "导出命令"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "800 I/T A5 series"
-msgstr "800 I/T A5系列"
+msgid "Ascend 950 Products"
+msgstr "Ascend 950产品"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "HDK >=25.6 with mooncake >= v0.3.11 <br>CANN >= 9.1.0"
@@ -336,18 +336,12 @@ msgstr ""
 "alignment-a3--ascend_enable_use_fabric_mem1) — 内存大小必须按1GB对齐。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "If any dependency above is not met"
-msgstr "如果上述任一依赖不满足"
+msgid "RoCE-based deployment"
+msgstr "基于 RoCE 的部署"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
-msgid "`export ASCEND_BUFFER_POOL=4:8`"
-msgstr "`export ASCEND_BUFFER_POOL=4:8`"
-
-#: ../../source/user_guide/feature_guide/kv_pool.md
-msgid ""
-"Configures the number and size of buffers on the NPU Device for aggregation "
-"and KV transfer (e.g., `4:8` means 4 buffers of 8MB)."
-msgstr "配置NPU设备上用于聚合和KV传输的缓冲区数量和大小（例如，`4:8` 表示4个8MB的缓冲区）。"
+msgid "Required when the deployment uses the RoCE path."
+msgstr "当部署使用 RoCE 路径时需要设置。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "800 I/T A2 series"
@@ -364,6 +358,16 @@ msgstr "`export HCCL_INTRA_ROCE_ENABLE=1`"
 #: ../../source/user_guide/feature_guide/kv_pool.md
 msgid "Required by direct transmission scheme on 800 I/T A2 series"
 msgstr "800 I/T A2系列直接传输方案所需"
+
+#: ../../source/user_guide/feature_guide/kv_pool.md
+msgid ""
+"> **Note:** `ASCEND_BUFFER_POOL` has been removed. Use "
+"`ASCEND_ENABLE_USE_FABRIC_MEM=1` for A3 HCCS scenarios or "
+"`HCCL_INTRA_ROCE_ENABLE=1` for A2/A3 RoCE scenarios instead."
+msgstr ""
+"> **注意：** `ASCEND_BUFFER_POOL` 已移除。请根据硬件场景使用 "
+"`ASCEND_ENABLE_USE_FABRIC_MEM=1`（A3 HCCS场景）或 "
+"`HCCL_INTRA_ROCE_ENABLE=1`（A2/A3 RoCE场景）替代。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:93
 msgid "Run Mooncake Master"
@@ -549,9 +553,10 @@ msgstr "将命令中的 localhost、端口和模型权重路径配置为您自�
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:411
 msgid ""
-"Note: For MooncakeStore with `ASCEND_BUFFER_POOL` enabled, it is recommended"
-" to perform a warm-up phase before running actual performance benchmarks."
-msgstr "注意：对于启用了 `ASCEND_BUFFER_POOL` 的 MooncakeStore，建议在实际性能基准测试前执行预热阶段。"
+"Note: For MooncakeStore with RoCE-based Device-to-Device communication "
+"enabled, it is recommended to perform a warm-up phase before running actual "
+"performance benchmarks."
+msgstr "注意：对于启用了基于 RoCE 的设备间通信的 MooncakeStore，建议在实际性能基准测试前进行预热阶段。"
 
 #: ../../source/user_guide/feature_guide/kv_pool.md:413
 msgid ""
@@ -1899,3 +1904,6 @@ msgstr ""
 #~ "When starting vLLM, explicitly set `UBSIO_CONFIG_PATH` to the same file as "
 #~ "`MMC_LOCAL_CONFIG_PATH`:"
 #~ msgstr "启动 vLLM 时，显式将 `UBSIO_CONFIG_PATH` 设置为与 `MMC_LOCAL_CONFIG_PATH` 相同的文件："
+
+#~ msgid "800 I/T A5 series"
+#~ msgstr "800 I/T A5系列"
