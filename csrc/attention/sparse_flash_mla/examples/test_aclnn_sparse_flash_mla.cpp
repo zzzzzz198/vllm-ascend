@@ -393,7 +393,7 @@ int main()
   aclDestroyTensor(metadata);
   aclDestroyTensor(attnOut);
   aclDestroyTensor(softmaxLse);
-
+  
   // 7. 释放device资源
   aclrtFree(qDeviceAddr);
   aclrtFree(oriKvDeviceAddr);

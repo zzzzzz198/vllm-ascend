@@ -1,182 +1,116 @@
-/**
+/*
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
  */
-/*!
- * \file sparse_flash_mla.cpp
- * \brief
- */
-
 #ifndef SPARSE_FLASH_MLA_TORCH_ADPT_H
 #define SPARSE_FLASH_MLA_TORCH_ADPT_H
 
 namespace vllm_ascend {
-constexpr int64_t DIM_0 = 0;
-constexpr int64_t DIM_1 = 1;
-constexpr int64_t DIM_2 = 2;
-constexpr int64_t DIM_3 = 3;
-constexpr int64_t DIM_4 = 4;
 
-constexpr int64_t SMLA_METADATA_SIZE = 1024;
+namespace {
 
-inline at::Tensor GetValidSparseFlashMlaTensor(
-    const c10::optional<at::Tensor> &tensor, const at::Device &device)
+std::tuple<at::Tensor, at::Tensor> construct_sparse_flash_mla_output(
+    const at::Tensor &query, const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv, c10::string_view layout_q,
+    c10::string_view layout_kv, bool return_softmax_lse)
 {
-    return tensor.has_value()
-               ? tensor.value()
-               : at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device));
-}
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    constexpr int64_t DIM_2 = 2;
+    constexpr int64_t QUERY_TND_DIM = 3;
+    constexpr int64_t QUERY_BSND_DIM = 4;
 
-at::Tensor npu_sparse_flash_mla_metadata(
-    int64_t numHeadsQ, int64_t numHeadsKv, int64_t headDim, const c10::optional<at::Tensor> &cuSeqlensQ,
-    const c10::optional<at::Tensor> &cuSeqlensOriKv, const c10::optional<at::Tensor> &cuSeqlensCmpKv,
-    const c10::optional<at::Tensor> &sequsedQ, const c10::optional<at::Tensor> &sequsedOriKv,
-    const c10::optional<at::Tensor> &sequsedCmpKv, const c10::optional<at::Tensor> &cmpResidualKv,
-    const c10::optional<at::Tensor> &oriTopkLength, const c10::optional<at::Tensor> &cmpTopkLength, int64_t batchSize,
-    int64_t maxSeqlenQ, int64_t maxSeqlenOriKv, int64_t maxSeqlenCmpKv, int64_t oriTopk, int64_t cmpTopk,
-    int64_t cmpRatio, int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
-    c10::string_view layoutQ, c10::string_view layoutKv, bool hasOriKv, bool hasCmpKv)
-{
-    at::Device outputDevice = at::Device(std::string("npu"));
-    if (cuSeqlensQ.has_value()) {
-        outputDevice = cuSeqlensQ.value().device();
-    } else if (cuSeqlensOriKv.has_value()) {
-        outputDevice = cuSeqlensOriKv.value().device();
-    } else if (cuSeqlensCmpKv.has_value()) {
-        outputDevice = cuSeqlensCmpKv.value().device();
-    } else if (sequsedQ.has_value()) {
-        outputDevice = sequsedQ.value().device();
-    } else if (sequsedOriKv.has_value()) {
-        outputDevice = sequsedOriKv.value().device();
-    } else if (sequsedCmpKv.has_value()) {
-        outputDevice = sequsedCmpKv.value().device();
-    } else if (cmpResidualKv.has_value()) {
-        outputDevice = cmpResidualKv.value().device();
-    } else if (oriTopkLength.has_value()) {
-        outputDevice = oriTopkLength.value().device();
-    } else if (cmpTopkLength.has_value()) {
-        outputDevice = cmpTopkLength.value().device();
+    const std::string layout_q_str(layout_q);
+    const std::string layout_kv_str(layout_kv);
+    TORCH_CHECK(layout_q_str == "BSND" || layout_q_str == "TND",
+                "layout_q must be BSND or TND, but got ", layout_q_str);
+    TORCH_CHECK((layout_q_str == "TND" && query.dim() == QUERY_TND_DIM) ||
+                    (layout_q_str == "BSND" && query.dim() == QUERY_BSND_DIM),
+                "query dimension does not match layout_q ", layout_q_str,
+                ", got dimension ", query.dim());
+    TORCH_CHECK(ori_kv.has_value() || cmp_kv.has_value(),
+                "At least one of ori_kv and cmp_kv must be provided.");
+
+    at::Tensor attention_output = at::empty(query.sizes(), query.options());
+    if (!return_softmax_lse) {
+        return {attention_output,
+                at::empty({0}, query.options().dtype(at::kFloat))};
     }
 
-    at::Tensor output = torch::empty({SMLA_METADATA_SIZE}, torch::dtype(torch::kInt32).device(outputDevice));
-    auto cuSeqlensQVal = GetValidSparseFlashMlaTensor(cuSeqlensQ, outputDevice);
-    auto cuSeqlensOriKvVal = GetValidSparseFlashMlaTensor(cuSeqlensOriKv, outputDevice);
-    auto cuSeqlensCmpKvVal = GetValidSparseFlashMlaTensor(cuSeqlensCmpKv, outputDevice);
-    auto sequsedQVal = GetValidSparseFlashMlaTensor(sequsedQ, outputDevice);
-    auto sequsedOriKvVal = GetValidSparseFlashMlaTensor(sequsedOriKv, outputDevice);
-    auto sequsedCmpKvVal = GetValidSparseFlashMlaTensor(sequsedCmpKv, outputDevice);
-    auto cmpResidualKvVal = GetValidSparseFlashMlaTensor(cmpResidualKv, outputDevice);
-    auto oriTopkLengthVal = GetValidSparseFlashMlaTensor(oriTopkLength, outputDevice);
-    auto cmpTopkLengthVal = GetValidSparseFlashMlaTensor(cmpTopkLength, outputDevice);
+    const at::Tensor &kv = ori_kv.has_value() ? *ori_kv : *cmp_kv;
+    TORCH_CHECK(kv.dim() > DIM_2,
+                "KV tensor must have at least 3 dimensions, but got ",
+                kv.dim());
+    const int64_t kv_head_num =
+        layout_kv_str == "TND" ? kv.size(DIM_1) : kv.size(DIM_2);
+    TORCH_CHECK(kv_head_num > 0, "KV head count must be positive.");
 
-    // convert str
-    std::string layoutQStr = std::string(layoutQ);
-    std::string layoutKvStr = std::string(layoutKv);
-    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
-    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
-
-    EXEC_NPU_CMD(aclnnSparseFlashMlaMetadata, cuSeqlensQVal, cuSeqlensOriKvVal, cuSeqlensCmpKvVal, sequsedQVal,
-              sequsedOriKvVal, sequsedCmpKvVal, cmpResidualKvVal, oriTopkLengthVal, cmpTopkLengthVal, numHeadsQ,
-              numHeadsKv, headDim, batchSize, maxSeqlenQ, maxSeqlenOriKv, maxSeqlenCmpKv, oriTopk, cmpTopk, cmpRatio,
-              oriMaskMode, cmpMaskMode, oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr, hasOriKv, hasCmpKv, output);
-    return output;
-}
-
-void CheckQueryShape(const at::Tensor &q, const std::string &layoutQStr)
-{
-    TORCH_CHECK(layoutQStr == "BSND" || layoutQStr == "TND", "The layout of query only support BSND and TND, but got ",
-                layoutQStr);
-    TORCH_CHECK(q.numel() > 0, "Tensor query is empty.");
-    for (int64_t i = 0; i < q.dim(); i++) {
-        TORCH_CHECK(q.size(i) > 0,
-                    "All values within query's shape should be greater "
-                    "than 0, but shape[",
-                    i, "] is ", q.size(i));
-    }
-    if (layoutQStr == "BSND") {
-        TORCH_CHECK(q.dim() == DIM_4, "When the layout of query is BSND, the query dimension must be 4, but got ",
-                    q.dim());
+    at::SmallVector<int64_t, 4> softmax_lse_size;
+    if (query.dim() == QUERY_TND_DIM) {
+        softmax_lse_size = {kv_head_num, query.size(DIM_0),
+                            query.size(DIM_1) / kv_head_num};
     } else {
-        TORCH_CHECK(q.dim() == DIM_3, "When the layout of query is TND, the query dimension must be 3, but got ",
-                    q.dim());
+        softmax_lse_size = {query.size(DIM_0), kv_head_num,
+                            query.size(DIM_1),
+                            query.size(DIM_2) / kv_head_num};
     }
+    return {attention_output,
+            at::empty(softmax_lse_size,
+                      query.options().dtype(at::kFloat))};
 }
 
-int64_t GetKvHeadNum(const c10::optional<at::Tensor> &oriKv, const c10::optional<at::Tensor> &cmpKv,
-                     const std::string &layoutKvStr)
-{
-    TORCH_CHECK(oriKv.has_value() || cmpKv.has_value(),
-                "ori_kv or cmp_kv is required when return_softmax_lse is true.");
-    const at::Tensor &kv = oriKv.has_value() ? oriKv.value() : cmpKv.value();
-    if (layoutKvStr == "TND") {
-        return kv.size(DIM_1);
-    }
-    return kv.size(DIM_2);
-}
-
-std::tuple<at::Tensor, at::Tensor> MakeSparseFlashMlaOutputs(const at::Tensor &q,
-                                                             const c10::optional<at::Tensor> &oriKv,
-                                                             const c10::optional<at::Tensor> &cmpKv,
-                                                             const std::string &layoutQStr,
-                                                             const std::string &layoutKvStr, bool returnSoftmaxLse)
-{
-    CheckQueryShape(q, layoutQStr);
-    at::Tensor attenOut = at::empty_like(q);
-    at::Tensor softmaxLse;
-    if (!returnSoftmaxLse) {
-        softmaxLse = at::empty({0}, q.options().dtype(torch::kFloat32));
-        return {attenOut, softmaxLse};
-    }
-
-    int64_t kvHeadNum = GetKvHeadNum(oriKv, cmpKv, layoutKvStr);
-    TORCH_CHECK(kvHeadNum > 0, "head num of ori_kv or cmp_kv must be greater than 0, but got ", kvHeadNum);
-    if (layoutQStr == "BSND") {
-        softmaxLse = at::empty({q.size(DIM_0), kvHeadNum, q.size(DIM_1), q.size(DIM_2) / kvHeadNum},
-                               q.options().dtype(torch::kFloat32));
-    } else {
-        softmaxLse =
-            at::empty({kvHeadNum, q.size(DIM_0), q.size(DIM_1) / kvHeadNum}, q.options().dtype(torch::kFloat32));
-    }
-    return {attenOut, softmaxLse};
-}
+}  // namespace
 
 std::tuple<at::Tensor, at::Tensor> npu_sparse_flash_mla(
-    const at::Tensor &q, const c10::optional<at::Tensor> &oriKv, const c10::optional<at::Tensor> &cmpKv,
-    const c10::optional<at::Tensor> &oriSparseIndices, const c10::optional<at::Tensor> &cmpSparseIndices,
-    const c10::optional<at::Tensor> &oriBlockTable, const c10::optional<at::Tensor> &cmpBlockTable,
-    const c10::optional<at::Tensor> &cuSeqlensQ, const c10::optional<at::Tensor> &cuSeqlensOriKv,
-    const c10::optional<at::Tensor> &cuSeqlensCmpKv, const c10::optional<at::Tensor> &sequsedQ,
-    const c10::optional<at::Tensor> &sequsedOriKv, const c10::optional<at::Tensor> &sequsedCmpKv,
-    const c10::optional<at::Tensor> &cmpResidualKv, const c10::optional<at::Tensor> &oriTopkLength,
-    const c10::optional<at::Tensor> &cmpTopkLength, const c10::optional<at::Tensor> &sinks,
-    const c10::optional<at::Tensor> &metadata, double softmaxScale, int64_t cmpRatio, int64_t oriMaskMode,
-    int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight, c10::string_view layoutQ, c10::string_view layoutKv,
-    int64_t topkValueMode, bool returnSoftmaxLse)
+    const at::Tensor &q, const c10::optional<at::Tensor> &ori_kv,
+    const c10::optional<at::Tensor> &cmp_kv,
+    const c10::optional<at::Tensor> &ori_sparse_indices,
+    const c10::optional<at::Tensor> &cmp_sparse_indices,
+    const c10::optional<at::Tensor> &ori_block_table,
+    const c10::optional<at::Tensor> &cmp_block_table,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_ori_kv,
+    const c10::optional<at::Tensor> &seqused_cmp_kv,
+    const c10::optional<at::Tensor> &cmp_residual_kv,
+    const c10::optional<at::Tensor> &ori_topk_length,
+    const c10::optional<at::Tensor> &cmp_topk_length,
+    const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, double softmax_scale,
+    int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode,
+    int64_t ori_win_left, int64_t ori_win_right, c10::string_view layout_q,
+    c10::string_view layout_kv, int64_t topk_value_mode,
+    bool return_softmax_lse)
 {
-    std::string layoutQStr = std::string(layoutQ);
-    std::string layoutKvStr = std::string(layoutKv);
-    // convert str
-    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
-    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+    TORCH_CHECK(q.numel() > 0, "Tensor q is empty.");
+    auto outputs = construct_sparse_flash_mla_output(
+        q, ori_kv, cmp_kv, layout_q, layout_kv, return_softmax_lse);
+    at::Tensor attn_out = std::get<0>(outputs);
+    at::Tensor softmax_lse = std::get<1>(outputs);
 
-    // construct the atten_out tensor
-    std::tuple<at::Tensor, at::Tensor> sparseFlashMlaAttenOut =
-        MakeSparseFlashMlaOutputs(q, oriKv, cmpKv, layoutQStr, layoutKvStr, returnSoftmaxLse);
-    at::Tensor attenOut = std::get<0>(sparseFlashMlaAttenOut);
-    at::Tensor softmaxLse = std::get<1>(sparseFlashMlaAttenOut);
+    std::string layout_q_str(layout_q);
+    std::string layout_kv_str(layout_kv);
+    char *layout_q_ptr = const_cast<char *>(layout_q_str.c_str());
+    char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
-    EXEC_NPU_CMD(aclnnSparseFlashMla, q, oriKv, cmpKv, oriSparseIndices, cmpSparseIndices, oriBlockTable, cmpBlockTable,
-              cuSeqlensQ, cuSeqlensOriKv, cuSeqlensCmpKv, sequsedQ, sequsedOriKv, sequsedCmpKv, cmpResidualKv,
-              oriTopkLength, cmpTopkLength, sinks, metadata, softmaxScale, cmpRatio, oriMaskMode, cmpMaskMode,
-              oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr, topkValueMode, returnSoftmaxLse, attenOut, softmaxLse);
-    return std::tuple<at::Tensor, at::Tensor>(attenOut, softmaxLse);
+    EXEC_NPU_CMD(
+        aclnnSparseFlashMla, q, ori_kv, cmp_kv, ori_sparse_indices,
+        cmp_sparse_indices, ori_block_table, cmp_block_table, cu_seqlens_q,
+        cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_ori_kv,
+        seqused_cmp_kv, cmp_residual_kv, ori_topk_length, cmp_topk_length,
+        sinks, metadata, softmax_scale, cmp_ratio, ori_mask_mode,
+        cmp_mask_mode, ori_win_left, ori_win_right, layout_q_ptr,
+        layout_kv_ptr, topk_value_mode, return_softmax_lse, attn_out,
+        softmax_lse);
+    return {attn_out, softmax_lse};
 }
 
-} // namespace vllm_ascend
+}  // namespace vllm_ascend
 
-#endif // SPARSE_FLASH_MLA_TORCH_ADPT_H
+#endif  // SPARSE_FLASH_MLA_TORCH_ADPT_H

@@ -13,8 +13,8 @@
  * \brief
  */
 
+#include "log/log.h"
 #include "aclnn_sparse_flash_mla_metadata.h"
-#include "../sparse_flash_mla_metadata_check.h"
 #include "sparse_flash_mla_metadata.h"
 #include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/reshape.h"
@@ -28,9 +28,7 @@
 #include "opdev/op_log.h"
 #include "opdev/tensor_view_utils.h"
 #include "opdev/make_op_executor.h"
-#include "acl/acl_rt.h"
-
-constexpr int64_t BATCH_CONSISTENCY_LEVEL = 3;
+#include "../sparse_flash_mla_metadata_check.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,13 +70,6 @@ aclnnStatus aclnnSparseFlashMlaMetadataGetWorkspaceSize(
     std::string socVersionStr = npuInfo.GetSocLongVersion();
     const char *socVersion = socVersionStr.c_str();
 
-    int64_t batchConsistencyLevel = 0;
-    aclError aclRet = aclrtGetSysParamOpt(ACL_OPT_DETERMINISTIC, &batchConsistencyLevel);
-    if (aclRet != ACL_SUCCESS) {
-        OP_LOGW("aclnnSparseFlashMlaMetadata unable to get system param batch consistency level.");
-    }
-    OP_LOGD("deterministic_level=%lld", batchConsistencyLevel);
-    bool isBatchConsistency = (batchConsistencyLevel == BATCH_CONSISTENCY_LEVEL);
     auto ret = ParamsCheck(cuSeqlensQOptional, cuSeqlensOriKvOptional, cuSeqlensCmpKvOptional, sequsedQOptional,
                            sequsedOriKvOptional, sequsedCmpKvOptional, cmpResidualKvOptional, oriTopkLengthOptional,
                            cmpTopkLengthOptional, numHeadsQ, numHeadsKv, headDim, batchSize, maxSeqlenQ, maxSeqlenOriKv,
@@ -166,10 +157,10 @@ aclnnStatus aclnnSparseFlashMlaMetadataGetWorkspaceSize(
         cmpResidualKvOptionalContiguous, oriTopkLengthOptionalContiguous, cmpTopkLengthOptionalContiguous, numHeadsQ,
         numHeadsKv, headDim, batchSize, maxSeqlenQ, maxSeqlenOriKv, maxSeqlenCmpKv, oriTopk, cmpTopk, cmpRatio,
         oriMaskMode, cmpMaskMode, oriWinLeft, oriWinRight, layoutQOptional, layoutKvOptional, hasOriKv, hasCmpKv,
-        socVersion, aicCoreNum, aivCoreNum, isBatchConsistency, metaData, uniqueExecutor.get());
+        socVersion, aicCoreNum, aivCoreNum, metaData, uniqueExecutor.get());
     CHECK_RET(output != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
-    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    *workspaceSize = 0;
     uniqueExecutor.ReleaseTo(executor);
     return ACLNN_SUCCESS;
 }
