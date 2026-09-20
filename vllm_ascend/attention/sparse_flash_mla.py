@@ -39,7 +39,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_CALL_PATH = os.environ.get("SMLA_CALL_PATH", "cann").strip().lower()
+_CALL_PATH = os.environ.get("SMLA_CALL_PATH", "ori").strip().lower()
 _ORI_WIN_LEFT = _env_int("SMLA_ORI_WIN_LEFT", 0)
 _ORI_WIN_RIGHT = _env_int("SMLA_ORI_WIN_RIGHT", 0)
 _ORI_CMP_MASK_MODE = _env_int("SMLA_ORI_CMP_MASK_MODE", 3)
