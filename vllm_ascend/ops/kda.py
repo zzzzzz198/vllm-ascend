@@ -70,17 +70,31 @@ def run_chunk_kda(
     dt_bias: torch.Tensor,
     *,
     lower_bound: float | None,
+    epsilon: float = 1e-6,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Consume preprocessed beta and return output plus the final VK state."""
-    # FLA's import-time capability queries can create an unwanted NPU context
-    # during operator discovery, before the worker selects its device.
-    # TODO: Restore the top-level import once supported vLLM FLA or Triton
-    # Ascend versions make these queries safe before device selection.
-    from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+    if use_qk_l2norm_in_kernel:
+        q = q.contiguous()
+        k = k.contiguous()
+        l2norm_kwargs = {
+            "epsilon": epsilon,
+            "use_qk_l2norm_in_kernel": True,
+        }
+    else:
+        # FLA's import-time capability queries can create an unwanted NPU context
+        # during operator discovery, before the worker selects its device.
+        # TODO: Restore the top-level import once supported vLLM FLA or Triton
+        # Ascend versions make these queries safe before device selection.
+        from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        l2norm_kwargs = {}
 
     output, final_state, *_ = chunk_kda_fwd(
-        l2norm_fwd(q.contiguous()),
-        l2norm_fwd(k.contiguous()),
+        q,
+        k,
         v.contiguous(),
         raw_gate.contiguous(),
         beta.contiguous(),
@@ -99,5 +113,6 @@ def run_chunk_kda(
         disable_recompute=False,
         return_intermediate_states=False,
         state_v_first=True,
+        **l2norm_kwargs,
     )
     return output, final_state

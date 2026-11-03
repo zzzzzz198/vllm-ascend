@@ -7,6 +7,7 @@ from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.ops.triton.kda.output_writeback import write_recurrent_output
 
 KDA_MAX_RECURRENT_TOKENS = 8
+KDA_L2NORM_EPSILON = 1e-6
 
 
 def recurrent_kda(
@@ -82,6 +83,8 @@ def chunk_kda(
         a_log,
         dt_bias,
         lower_bound=lower_bound,
+        epsilon=KDA_L2NORM_EPSILON,
+        use_qk_l2norm_in_kernel=True,
     )
     scatter_states(state, final_state.to(state.dtype), state_indices)
     return output

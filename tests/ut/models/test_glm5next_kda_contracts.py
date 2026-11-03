@@ -98,6 +98,9 @@ def test_chunk_uses_host_descriptors_and_preserves_vk_cache(monkeypatch, state_d
     )
 
     def chunk(q_arg, k_arg, v, g, beta, scale, chunk_size, **kwargs):
+        assert q_arg is q and k_arg is q
+        assert kwargs["epsilon"] == kda.KDA_L2NORM_EPSILON
+        assert kwargs["use_qk_l2norm_in_kernel"]
         assert kwargs["state_v_first"] and kwargs["use_gate_in_kernel"] and kwargs["safe_gate"]
         assert kwargs["cu_seqlens"] is metadata.cu_seqlens_host
         assert kwargs["chunk_indices"] is metadata.chunk_indices_chunk64_host
@@ -108,8 +111,11 @@ def test_chunk_uses_host_descriptors_and_preserves_vk_cache(monkeypatch, state_d
         torch.testing.assert_close(beta, torch.full_like(beta, 0.5))
         return v, torch.full_like(kwargs["initial_state"], 17)
 
+    def unexpected_l2norm(x):
+        raise AssertionError("GLM V2 must normalize Q/K inside ChunkKDA")
+
     monkeypatch.setattr(kda_ops, "chunk_kda_fwd", chunk)
-    monkeypatch.setattr("vllm.third_party.flash_linear_attention.ops.l2norm.l2norm_fwd", lambda x: x)
+    monkeypatch.setattr("vllm.third_party.flash_linear_attention.ops.l2norm.l2norm_fwd", unexpected_l2norm)
     out = kda.chunk_kda(
         q, q, q, q, torch.zeros(1, 3, 1), state, indices, has_initial, metadata, torch.zeros(1), torch.zeros(128), -4
     )
@@ -121,3 +127,39 @@ def test_chunk_uses_host_descriptors_and_preserves_vk_cache(monkeypatch, state_d
         torch.testing.assert_close(state[1], saved[1])
     else:
         assert (state[1] == 17).all()
+
+
+def test_run_chunk_kda_defaults_to_external_l2norm(monkeypatch):
+    q = torch.ones(1, 1, 1, 128, dtype=torch.bfloat16)
+    state = torch.zeros(1, 1, 128, 128, dtype=torch.float32)
+    norm_calls = []
+
+    def norm(x):
+        norm_calls.append(x)
+        return x
+
+    def chunk(q_arg, k_arg, v, g, beta, scale, chunk_size, **kwargs):
+        assert "epsilon" not in kwargs
+        assert "use_qk_l2norm_in_kernel" not in kwargs
+        return v, state
+
+    monkeypatch.setattr("vllm.third_party.flash_linear_attention.ops.l2norm.l2norm_fwd", norm)
+    monkeypatch.setattr(kda_ops, "chunk_kda_fwd", chunk)
+    output, final_state = kda_ops.run_chunk_kda(
+        q,
+        q,
+        q,
+        q,
+        torch.zeros(1, 1, 1),
+        state,
+        (0, 1),
+        (0, 0),
+        torch.zeros(1),
+        torch.zeros(128),
+        lower_bound=-4,
+    )
+
+    assert len(norm_calls) == 2
+    assert norm_calls[0] is q and norm_calls[1] is q
+    assert output is q
+    assert final_state is state
