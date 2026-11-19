@@ -551,11 +551,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 dim=-1,
             )
 
-            # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
-            # at load (SIGMOID_BETA), and only the chunked prefill path needs the
-            # pre-computed fp32 sigmoid — computed lazily in _forward_core. Pure decode
-            # / spec-verify steps then skip the separate sigmoid and its fp32
-            # intermediate entirely.
+            # Beta stays raw (bf16) here: recurrent and A5 chunk32 kernels apply
+            # sigmoid internally. Other chunked prefill paths compute the fp32
+            # sigmoid lazily in _forward_core. Pure decode / spec-verify steps
+            # skip the separate sigmoid and its fp32 intermediate entirely.
             beta = beta_raw.unsqueeze(0)
             g1 = self.f_b_proj(f_a)[0]
             g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)

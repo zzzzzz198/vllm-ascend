@@ -84,8 +84,10 @@ def test_recurrent_raw_gates_rollback_slots_and_padding(monkeypatch, accepted, q
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("compact", [False, True])
-def test_chunk_uses_host_descriptors_and_preserves_vk_cache(monkeypatch, state_dtype, compact):
+@pytest.mark.parametrize("chunk32", [False, True])
+def test_chunk_dispatch_and_preserves_vk_cache(monkeypatch, state_dtype, compact, chunk32):
     q = torch.ones(1, 3, 1, 128, dtype=torch.bfloat16)
+    raw_beta = torch.zeros(1, 3, 1, dtype=torch.bfloat16)
     state = torch.arange(4 * 128 * 128, dtype=torch.float32).reshape(4, 1, 128, 128).to(state_dtype)
     saved = state.clone()
     indices = torch.tensor([3, 1], dtype=torch.int32)
@@ -97,26 +99,37 @@ def test_chunk_uses_host_descriptors_and_preserves_vk_cache(monkeypatch, state_d
         cu_seqlens_kern=None,
         chunk_indices_chunk64_host=(0, 0) if compact else (0, 0, 1, 0),
     )
+    profile = MagicMock()
+    profile.supports.return_value = chunk32
+    monkeypatch.setattr(kda, "get_current_hardware_profile", MagicMock(return_value=profile))
 
     def chunk(q_arg, k_arg, v, g, beta, scale, chunk_size, **kwargs):
+        assert chunk_size == (32 if chunk32 else 64)
         assert kwargs["state_v_first"] and kwargs["use_gate_in_kernel"] and kwargs["safe_gate"]
         assert kwargs["cu_seqlens"] is metadata.cu_seqlens_host
-        assert kwargs["chunk_indices"] is metadata.chunk_indices_chunk64_host
+        expected_indices = None if chunk32 else metadata.chunk_indices_chunk64_host
+        assert kwargs["chunk_indices"] is expected_indices
         assert kwargs["initial_state"].dtype == torch.float32
         assert kwargs["use_qk_l2norm_in_kernel"] is True
+        assert kwargs["use_beta_sigmoid_in_kernel"] is chunk32
+        assert kwargs["allow_neg_eigval"] is False
+        assert kwargs["use_exp2"] is True
         assert l2norm.call_count == 0
         torch.testing.assert_close(kwargs["initial_state"][0], saved[3].float())
         if not compact:
             assert torch.count_nonzero(kwargs["initial_state"][1]) == 0
-        torch.testing.assert_close(beta, torch.full_like(beta, 0.5))
+        expected_beta = raw_beta if chunk32 else raw_beta.float().sigmoid()
+        torch.testing.assert_close(beta, expected_beta)
+        assert beta.dtype == expected_beta.dtype
         return v, torch.full_like(kwargs["initial_state"], 17)
 
     monkeypatch.setattr(kda_ops, "chunk_kda_fwd", chunk)
     l2norm = MagicMock(side_effect=lambda x: x)
     monkeypatch.setattr("vllm.third_party.flash_linear_attention.ops.l2norm.l2norm_fwd", l2norm)
     out = kda.chunk_kda(
-        q, q, q, q, torch.zeros(1, 3, 1), state, indices, has_initial, metadata, torch.zeros(1), torch.zeros(128), -4
+        q, q, q, q, raw_beta, state, indices, has_initial, metadata, torch.zeros(1), torch.zeros(128), -4
     )
+    profile.supports.assert_called_once_with(kda.HardwareCapability.FLA_KDA_PREFILL_CHUNK32)
     for call in l2norm.call_args_list:
         assert call.args[0].is_contiguous()
         torch.testing.assert_close(call.args[0], q)

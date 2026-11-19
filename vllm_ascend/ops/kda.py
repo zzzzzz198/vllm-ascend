@@ -11,6 +11,7 @@ import torch
 from fla_npu.ops.ascendc import chunk_kda_fwd, recurrent_kda
 
 KDA_CHUNK_SIZE = 64
+KDA_FUSED_CHUNK_SIZE = 32
 
 
 def run_recurrent_kda(
@@ -65,14 +66,16 @@ def run_chunk_kda(
     beta: torch.Tensor,
     initial_state: torch.Tensor,
     cu_seqlens: Sequence[int],
-    chunk_indices: Sequence[int],
+    chunk_indices: Sequence[int] | None,
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     *,
     lower_bound: float | None,
     use_qk_l2norm_in_kernel: bool = False,
+    chunk_size: int = KDA_CHUNK_SIZE,
+    beta_is_preprocessed: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Consume preprocessed beta and return output plus the final VK state."""
+    """Return chunk prefill output plus the final VK state."""
     # FLA's import-time capability queries can create an unwanted NPU context
     # during operator discovery, before the worker selects its device.
     # TODO: Restore the top-level import once supported vLLM FLA or Triton
@@ -93,7 +96,7 @@ def run_chunk_kda(
         raw_gate.contiguous(),
         beta.contiguous(),
         q.shape[-1] ** -0.5,
-        KDA_CHUNK_SIZE,
+        chunk_size,
         layout="BSND",
         initial_state=initial_state,
         output_final_state=True,
@@ -103,6 +106,9 @@ def run_chunk_kda(
         lower_bound=lower_bound if lower_bound is not None else -5.0,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=not beta_is_preprocessed,
+        allow_neg_eigval=False,
+        use_exp2=True,
         A_log=a_log.reshape(-1).contiguous(),
         dt_bias=dt_bias.contiguous(),
         disable_recompute=False,
