@@ -23,9 +23,14 @@
   output = next_state @ normalized_scaled_q
   ```
 
-  Verification records `correction` and the unnormalized `k/raw_g`. Commit
-  reconstructs `next_state` through the accepted prefix from those records and
-  the original checkpoint. Softplus uses its linear branch above 20.
+  Verification normally records `correction` and the unnormalized `k/raw_g`.
+  The GLM Mega KDA path can instead record normalized FP16 `k` and precomputed
+  FP32 `decay` by supplying `decay_cache`; its fallback verify uses the same
+  representation. Mega pools have one row per checkpoint page and are indexed
+  by `state_indices`, including during fallback verify and commit. Commit
+  reconstructs `next_state` through the accepted prefix from either record
+  representation and the original checkpoint. Softplus uses
+  its linear branch above 20.
 - **Algorithm flow** (independent requests and heads, with value-dimension tiles):
   1. `_kda_recoverssm_verify_kernel` loads a request's checkpoint, advances a
      register-held recurrence, writes outputs and compact records, and leaves the
@@ -42,7 +47,9 @@
      accumulates decay/products and correction outer products, and writes the
      reconstructed recurrent checkpoint. `_commit_kda_state_grouped_kernel`
      performs the same operation for two adjacent heads per program on its A5
-     fast path. All aligned contexts use two disjoint on-device request filters
+     fast path. `_commit_mega_kda_state_kernel` consumes the separate normalized
+     key/decay records without recomputing the raw gate. All aligned contexts use
+     two disjoint on-device request filters
      to separate commits with and without a boundary snapshot. Non-crossing
      requests use two matrix buffers; crossing requests retain the existing
      six-buffer recovery path. A5 uses grouped heads for FP32 `H32/H64`,
@@ -74,7 +81,8 @@ An optional argument's default is part of its description.
 | `lower_bound` | Attribute | Gate lower bound; `None` selects negative softplus instead of bounded sigmoid | Python float / `None` | Scalar / N/A |
 | `checkpoint_state` | Input | Persistent recurrent state `[P, H, V, K]`, read-only during verification | FP32 / BF16 | Paged ND, explicit strides |
 | `correction_cache` | Output | Per-token correction records `[R, H, Q, V]` indexed by request | FP32 | ND, explicit strides |
-| `kg_cache` | Output | Raw key and gate, `[R, H, Q, 2 * K]` indexed by request | Same dtype as `k` | ND, explicit strides |
+| `kg_cache` | Output | Raw key/gate `[R, H, Q, 2 * K]`, or normalized key `[R, H, Q, K]` when `decay_cache` is supplied | Activation dtype, or FP16 for separate key/decay | ND, explicit strides |
+| `decay_cache` | Output | Optional precomputed decay `[R, H, Q, K]`; default `None` selects packed raw key/gate records | FP32 | ND; strides match `kg_cache` |
 | `query_start_loc` | Input | Nondecreasing token offsets `[B + 1]` | INT32 / INT64 | Strided 1D |
 | `state_indices` | Input | Source page per speculative row `[B]`; values at or below `NULL_BLOCK_ID` select null rows | INT32 | Strided 1D |
 | `spec_query_len` | Attribute | `Q`, normally `num_speculative_tokens + 1` | Python int | Positive scalar |
@@ -95,13 +103,14 @@ Required layer fields:
 | --- | --- | --- | --- | --- |
 | `kv_cache[0]` | Input/Output | Convolution state; normalized view `[P, C, Q + W - 1]` | BF16 in validated callers | Paged ND; channel-first or token-first physical layout |
 | `kv_cache[1]` | Input/Output | Recurrent checkpoint `[P, H, V, K]` | FP32 / BF16 | Paged ND |
-| `recoverssm_records` | Input | Correction and key/gate scratch buffers with `R >= max_num_reqs` | FP32 and activation dtype | Request-indexed ND |
+| `recoverssm_records` | Input | Correction plus packed key/gate, or separate normalized-key/`replay_decay`; request records need `R >= max_num_reqs`, Mega records need `R = P` | FP32 correction/decay and activation/FP16 key | Request-indexed or page-indexed ND |
 | `A_log` | Input | Decay parameter with `H` elements, stacked as `[L, H]` internally | FP32 in validated callers | ND |
 | `dt_bias` | Input | Gate bias with `H * K` elements, stacked as `[L, H, K]` internally | FP32 in validated callers | ND |
 | `gate_lower_bound` | Attribute | Shared `lower_bound` across layers | Python float / `None` | Scalar / N/A |
 | `local_num_heads`, `head_dim` | Attribute | `H` and `K`, used to view gate parameters | Python int | Positive scalars |
 
-Each context uses two cache tensors plus request-indexed `recoverssm_records`.
+Each context uses two cache tensors plus request-indexed `recoverssm_records`;
+the Mega representation instead shares the checkpoint's page-indexing domain.
 
 ### `KDARecoverSSMCommitContext.commit`
 
@@ -220,7 +229,9 @@ for single-layer calls; it does not introduce a layer-count constexpr.
 
 The NPU test file uses an independent CPU FP64 forward recurrence for verify
 outputs, FP32 correction records and accepted states. Raw key/gate records and
-convolution compaction are compared exactly. AscendC is an additional reference
+convolution compaction are compared exactly. The A5 Mega case additionally
+checks normalized FP16 keys, FP32 decay and partial accepted-state recovery.
+AscendC is an additional reference
 for zero/small-norm inputs, rather than the only mathematical reference.
 
 Each arithmetic comparison uses the **actual output storage dtype**, computes

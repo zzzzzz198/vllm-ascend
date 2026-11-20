@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -33,11 +34,24 @@ from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.distributed.parallel_state import get_qkv_iproj_tp_group
 from vllm_ascend.models.glm5next.kda_input_projection_tp import KDAInputProjectionTP
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_kda, recurrent_kda
+from vllm_ascend.models.glm5next.ops.mega_kda import (
+    MEGA_KDA_HEAD_DIM,
+    MEGA_KDA_HIDDEN_SIZE,
+    MEGA_KDA_NUM_HEADS,
+    MEGA_KDA_SPEC_QUERY_LEN,
+    MegaKDARecoverSSMRecords,
+    MegaKDAWeights,
+    find_mega_kda_op,
+    get_mega_kda_op,
+    prepare_mega_kda_weights,
+    run_mega_kda_decode,
+)
 from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.ops.triton.kda.recoverssm import kda_recoverssm_verify
@@ -409,8 +423,28 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         self.A_log = nn.Parameter(torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32))
         set_weight_attrs(self.A_log, {"weight_loader": self._a_log_weight_loader})
-        self.recoverssm_records: KDARecoverSSMRecords | None = None
-        if self.use_recoverssm:
+        compilation_config = get_current_vllm_config().compilation_config
+        self._mega_kda_weights: MegaKDAWeights | None = None
+        self._mega_kda_operator = None
+        self._mega_kda_enabled = (
+            self.use_recoverssm
+            and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGA_KDA)
+            and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            and self.hidden_size == MEGA_KDA_HIDDEN_SIZE
+            and self.num_heads == self.local_num_heads == MEGA_KDA_NUM_HEADS
+            and self.head_dim == MEGA_KDA_HEAD_DIM
+            and self.num_spec + 1 == MEGA_KDA_SPEC_QUERY_LEN
+            and self.conv_size == 4
+            and self.projection_tp is None
+            and not self.use_pcp_head_sharding
+            and not is_conv_state_dim_first()
+            and self.get_state_dtype()[1] == torch.float32
+            and find_mega_kda_op() is not None
+        )
+        self.recoverssm_records: KDARecoverSSMRecords | MegaKDARecoverSSMRecords | None = None
+        if self._mega_kda_enabled:
+            self.recoverssm_records = MegaKDARecoverSSMRecords()
+        elif self.use_recoverssm:
             # Importing Kimi's package can load FLA and initialize an NPU.
             # Defer it until the worker has selected its device.
             from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords as KDARecords
@@ -448,6 +482,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=saved_quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if self._mega_kda_enabled and not isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            self._mega_kda_enabled = False
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords as KDARecords
+
+            self.recoverssm_records = KDARecords.allocate(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.local_num_heads,
+                self.num_spec + 1,
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.A_log.device,
+            )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -486,6 +532,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self._merged_conv_weight = merged
         else:
             self._merged_conv_weight.copy_(merged)
+        if getattr(self, "_mega_kda_enabled", False):
+            self._mega_kda_weights = prepare_mega_kda_weights(self)
+            self._mega_kda_operator = get_mega_kda_op()
 
     def _dt_bias_weight_loader(self, param, loaded_weight):
         shard_size = param.shape[0]
@@ -518,6 +567,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     def _forward(self, hidden_states: torch.Tensor, output_buffer: torch.Tensor | None) -> torch.Tensor | None:
         attn_metadata_raw = get_forward_context().attn_metadata
         attn_metadata = attn_metadata_raw.get(self.prefix) if isinstance(attn_metadata_raw, dict) else None
+        if getattr(self, "_mega_kda_enabled", False) and getattr(attn_metadata, "mega_kda_decode", False):
+            wait_for_kv_layer_from_connector(self.prefix)
+            record_attention_compute_start()
+            output = run_mega_kda_decode(self, hidden_states, attn_metadata)
+            maybe_save_kv_layer_to_connector("", [])
+            if output_buffer is None:
+                return output
+            output_buffer.copy_(output)
+            return None
         pcp_context = getattr(attn_metadata, "pcp_context", None)
         has_pcp_prefill = pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any())
         local_num_tokens = hidden_states.size(0)
@@ -770,6 +828,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     spec_query_start_loc,
                     spec_state_indices_tensor[:, 0],
                     self.num_spec + 1,
+                    **({"decay_cache": records.replay_decay} if isinstance(records, MegaKDARecoverSSMRecords) else {}),
                 )
             else:
                 spec_output = recurrent_kda(

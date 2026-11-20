@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU contracts for request-indexed RecoverSSM records."""
+"""CPU contracts for request- and page-indexed RecoverSSM records."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_ascend.models.glm5next.ops.mega_kda import MegaKDARecoverSSMRecords
 from vllm_ascend.ops.triton.kda import recoverssm
 
 
@@ -21,12 +22,21 @@ class RecordingKernel:
         return launch
 
 
-def make_layer(*, pages=11, rows=4, heads=2, dim=4, capacity=4):
+def make_layer(*, pages=11, rows=4, heads=2, dim=4, capacity=4, mega=False):
     conv = torch.zeros(pages, 3 * heads * dim, capacity + 2, dtype=torch.bfloat16)
     state = torch.zeros(pages, heads, dim, dim)
-    correction = torch.zeros(rows, heads, capacity, dim)
-    key_gate = torch.zeros(rows, heads, capacity, 2 * dim, dtype=torch.bfloat16)
+    record_rows = pages if mega else rows
+    correction = torch.zeros(record_rows, heads, capacity, dim)
+    key_gate = torch.zeros(
+        record_rows,
+        heads,
+        capacity,
+        dim if mega else 2 * dim,
+        dtype=torch.float16 if mega else torch.bfloat16,
+    )
     records = SimpleNamespace(correction=correction, key_gate=key_gate)
+    if mega:
+        records.replay_decay = torch.zeros_like(correction)
     return SimpleNamespace(
         kv_cache=(conv, state),
         recoverssm_records=records,
@@ -115,3 +125,78 @@ def test_commit_launches_for_request_records(monkeypatch):
         torch.tensor([0, 3, 5], dtype=torch.int32),
     )
     assert len(plan.calls) == len(compact.calls) == len(commit.calls) == 1
+
+
+def test_mega_verify_writes_separate_normalized_key_and_decay(monkeypatch):
+    layer = make_layer(mega=True)
+    records = layer.recoverssm_records
+    q = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    beta = torch.randn(1, 5, 2, dtype=q.dtype)
+    kernel = RecordingKernel()
+    monkeypatch.setattr(recoverssm, "_kda_recoverssm_verify_kernel", kernel)
+
+    out = recoverssm.kda_recoverssm_verify(
+        q,
+        q,
+        q,
+        q,
+        beta,
+        layer.A_log,
+        layer.dt_bias,
+        -5.0,
+        layer.kv_cache[1],
+        records.correction,
+        records.key_gate,
+        torch.tensor([0, 3, 5], dtype=torch.int32),
+        torch.tensor([7, 3], dtype=torch.int32),
+        4,
+        decay_cache=records.replay_decay,
+    )
+
+    assert out.shape == q.shape
+    args, kwargs = kernel.calls[0][1:]
+    assert args[10] is records.replay_decay
+    assert kwargs["SEPARATE_KEY_DECAY"] is True
+
+
+def test_mega_commit_uses_precomputed_decay_and_checks_rebinding(monkeypatch):
+    layer = make_layer(mega=True)
+    context = recoverssm.KDARecoverSSMCommitContext.create([layer], spec_query_len=4, max_num_reqs=4)
+    assert context.is_bound_to([layer])
+    assert context.decay_caches[0] is layer.recoverssm_records.replay_decay
+    plan, compact = RecordingKernel(), RecordingKernel()
+    mega_commit, old_commit = RecordingKernel(), RecordingKernel()
+    monkeypatch.setattr(recoverssm, "_prepare_commit_plan_kernel", plan)
+    monkeypatch.setattr(recoverssm, "_compact_conv_state_kernel", compact)
+    monkeypatch.setattr(recoverssm, "_commit_mega_kda_state_kernel", mega_commit)
+    monkeypatch.setattr(recoverssm, "_commit_kda_state_kernel", old_commit)
+
+    context.commit(
+        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([7, 3], dtype=torch.int32),
+        torch.tensor([0, 3, 5], dtype=torch.int32),
+    )
+
+    assert len(plan.calls) == len(compact.calls) == len(mega_commit.calls) == 1
+    assert not old_commit.calls
+    args, kwargs = mega_commit.calls[0][1:]
+    assert args[9] is layer.recoverssm_records.replay_decay
+    assert "USE_LOWER_BOUND" not in kwargs
+    layer.recoverssm_records.replay_decay = layer.recoverssm_records.replay_decay.clone()
+    assert not context.is_bound_to([layer])
+
+
+def test_context_binds_empty_mega_records_to_checkpoint_pages():
+    layer = make_layer(mega=True)
+    records = MegaKDARecoverSSMRecords()
+    layer.recoverssm_records = records
+
+    context = recoverssm.KDARecoverSSMCommitContext.create([layer], spec_query_len=4, max_num_reqs=4)
+
+    assert records.correction.shape == (11, 2, 4, 4)
+    assert records.replay_k.dtype == torch.float16
+    assert records.replay_decay.dtype == torch.float32
+    assert context.correction_caches[0] is records.correction
+    assert context.kg_caches[0] is records.replay_k
+    assert context.decay_caches[0] is records.replay_decay
+    assert context.is_bound_to([layer])

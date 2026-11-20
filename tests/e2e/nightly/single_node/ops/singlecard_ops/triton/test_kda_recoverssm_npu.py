@@ -486,6 +486,81 @@ def reference(q, k, v, raw_g, raw_beta, a_log, bias, lower_bound, state, starts,
     return output, final, records
 
 
+@pytest.mark.skip_global_cleanup
+@torch.inference_mode()
+def test_mega_records_commit_matches_independent_recurrence(record_property):
+    if not torch.npu.is_available() or not is_950():
+        pytest.skip("requires Mega KDA on an Ascend 950 NPU")
+    torch.manual_seed(16634)
+    device, heads, dim, capacity = "npu", 64, 128, 6
+    blocks, accepted = [3, 1], [6, 2]
+    starts = [0, 6, 12]
+    indices = torch.tensor(blocks, dtype=torch.int32, device=device)
+    offsets = torch.tensor(starts, dtype=torch.int32, device=device)
+    counts = torch.tensor(accepted, dtype=torch.int32, device=device)
+    q, k, v, gate = (torch.randn(1, starts[-1], heads, dim, dtype=torch.bfloat16, device=device) for _ in range(4))
+    beta = torch.randn(1, starts[-1], heads, dtype=torch.bfloat16, device=device)
+    a_log = torch.randn(heads, device=device) * 0.1
+    bias = torch.randn(heads * dim, device=device) * 0.1
+    state = torch.randn(8, heads, dim, dim, device=device) * 0.05
+    initial = state.clone()
+    correction = torch.full((8, heads, capacity, dim), float("nan"), device=device)
+    replay_k = torch.full((8, heads, capacity, dim), float("nan"), dtype=torch.float16, device=device)
+    replay_decay = torch.full((8, heads, capacity, dim), float("nan"), device=device)
+    conv = torch.zeros(8, 3 * heads * dim, capacity + 2, dtype=torch.bfloat16, device=device)
+    if not is_conv_state_dim_first():
+        conv = conv.transpose(-1, -2).contiguous()
+    records = SimpleNamespace(correction=correction, key_gate=replay_k, replay_decay=replay_decay)
+    layer = SimpleNamespace(
+        kv_cache=(conv, state),
+        recoverssm_records=records,
+        A_log=a_log,
+        dt_bias=bias,
+        gate_lower_bound=-5.0,
+        local_num_heads=heads,
+        head_dim=dim,
+    )
+    context = KDARecoverSSMCommitContext.create([layer], spec_query_len=capacity, max_num_reqs=2)
+    expected_out, expected_state, expected_records = reference(
+        q, k, v, gate, beta, a_log, bias, -5.0, initial, starts, blocks, accepted
+    )
+
+    output = kda_recoverssm_verify(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a_log,
+        bias,
+        -5.0,
+        state,
+        correction,
+        replay_k,
+        offsets,
+        indices,
+        capacity,
+        decay_cache=replay_decay,
+    )
+    assert_accuracy(output, expected_out, record_property, "mega_verify")
+    torch.testing.assert_close(state, initial, atol=0, rtol=0)
+    for row, block in enumerate(blocks):
+        expected_correction, expected_kg = expected_records[block]
+        assert_accuracy(correction[block], expected_correction, record_property, f"mega_correction_{row}")
+        normalized_k = expected_kg[:, :, :dim]
+        normalized_k = normalized_k * torch.rsqrt(normalized_k.square().sum(-1, keepdim=True) + 1e-6)
+        assert_accuracy(replay_k[block], normalized_k, record_property, f"mega_key_{row}")
+        gate_input = expected_kg[:, :, dim:] + bias.cpu().double().view(heads, dim)
+        decay = (-5.0 * torch.sigmoid(a_log.cpu().double().view(heads, 1).exp() * gate_input)).exp()
+        assert_accuracy(replay_decay[block], decay, record_property, f"mega_decay_{row}")
+        correction[block, :, accepted[row] :] = float("nan")
+        replay_k[block, :, accepted[row] :] = float("nan")
+        replay_decay[block, :, accepted[row] :] = float("nan")
+
+    context.commit(counts, indices, offsets)
+    assert_accuracy(state, expected_state, record_property, "mega_commit")
+
+
 @pytest.mark.parametrize("num_spec", [0, 1, 3, 5, 7])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float16])

@@ -10,6 +10,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
+from vllm_ascend.models.glm5next.ops.mega_kda import MEGA_KDA_SPEC_QUERY_LEN
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
@@ -90,6 +91,16 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
         metadata.non_spec_prefill_metadata = None
         metadata.non_spec_decode_metadata = None
         metadata.spec_decode_metadata = None
+        query_lens = m.query_start_loc_cpu.diff()
+        active_query_lens = query_lens[query_lens > 0]
+        metadata.mega_kda_decode = bool(
+            self.num_spec + 1 == MEGA_KDA_SPEC_QUERY_LEN
+            and metadata.num_spec_decodes > 0
+            and metadata.num_prefills == 0
+            and metadata.num_decodes == 0
+            and active_query_lens.numel() == metadata.num_spec_decodes
+            and torch.all(active_query_lens == MEGA_KDA_SPEC_QUERY_LEN).item()
+        )
         if metadata.num_spec_decodes:
             self._stage_spec(metadata, m.num_reqs)
             state_indices = metadata.spec_state_indices_tensor[:, 0]
