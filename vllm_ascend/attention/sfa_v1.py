@@ -32,6 +32,10 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     is_pcp_decode_sharding_enabled,
 )
 from vllm_ascend.attention.indexer import AscendSFAIndexerCache
+from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
+    mixed_quant_sparse_flash_mla_metadata_ori_fp8,
+    mixed_quant_sparse_flash_mla_ori_fp8,
+)
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -86,6 +90,8 @@ from vllm_ascend.weight_switch import ParallelOProjection, WeightSwitchConfig
 
 # NoPE sparse MLA operator helpers.
 SMLA_METADATA_SIZE = 1024
+MQSMLA_METADATA_SIZE = 2048
+MQSMLA_FP8_GROUP_SIZE = 32
 # GLM5Next's SFA path carries no learnable attention sink, but SparseFlashMla
 # still requires a per-head float32 sinks tensor. This is the placeholder value
 # the path has always used; whether -inf is the correct "no sink" value is a
@@ -249,6 +255,66 @@ def sparse_mla(query, cache, indices, metadata, scale):
     return result[0]
 
 
+def generate_mqsmla_plan(metadata, num_heads, topk, cu_seqlens_q, topk_length):
+    return mixed_quant_sparse_flash_mla_metadata_ori_fp8(
+        num_heads_q=num_heads,
+        num_heads_kv=1,
+        head_dim=512,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_ori_kv=metadata.seq_lens,
+        ori_topk_length=topk_length,
+        batch_size=metadata.seq_lens.numel(),
+        max_seqlen_q=metadata.max_query_len,
+        max_seqlen_ori_kv=metadata.max_seq_len,
+        max_seqlen_cmp_kv=0,
+        ori_topk=topk,
+        cmp_topk=0,
+        device=str(metadata.seq_lens.device),
+    )
+
+
+def build_mqsmla_metadata(metadata, buffer, num_heads, topk, cu_seqlens_q, topk_length):
+    generated = generate_mqsmla_plan(metadata, num_heads, topk, cu_seqlens_q, topk_length)
+    if generated.numel() != buffer.numel():
+        raise ValueError(f"MQSMLA plan must contain {buffer.numel()} int32 values, got {generated.numel()}.")
+    buffer.copy_(generated)
+    metadata.smla_metadata = buffer
+
+
+def sparse_mqsmla(query, cache, indices, metadata, scale):
+    indices = indices.contiguous()
+    cache = _view_cache_as_operator_pages(cache, metadata.block_size).view(torch.uint8)
+    if metadata.smla_metadata is None:
+        raise RuntimeError("MQSMLA requires persistent metadata owned by SparseMLAMetadataState.")
+    topk_length = metadata.smla_topk_length[: query.shape[0]]
+    metadata.smla_topk_length.zero_()
+    valid = metadata.smla_valid_mask[: query.shape[0]]
+    topk_length.copy_((indices >= 0).sum(dim=-1, dtype=torch.int32).masked_fill(~valid, 0))
+    cu_seqlens_q = metadata.query_start_loc
+    if query.shape[0] != metadata.smla_topk_length.shape[0]:
+        cu_seqlens_q = cu_seqlens_q.clamp(max=query.shape[0])
+    build_mqsmla_metadata(
+        metadata,
+        metadata.smla_metadata,
+        query.shape[1],
+        indices.shape[-1],
+        cu_seqlens_q,
+        topk_length,
+    )
+    result = mixed_quant_sparse_flash_mla_ori_fp8(
+        query.contiguous(),
+        ori_kv=cache,
+        ori_sparse_indices=indices,
+        ori_block_table=metadata.block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_ori_kv=metadata.seq_lens,
+        ori_topk_length=topk_length,
+        metadata=metadata.smla_metadata,
+        softmax_scale=scale,
+    )
+    return result[0]
+
+
 class SparseMLAMetadataState:
     """Persistent operator buffers for NoPE within the shared SFA builder.
 
@@ -261,9 +327,10 @@ class SparseMLAMetadataState:
         if block_size <= 0 or block_size % kernel_block_size:
             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
         self.split = block_size // kernel_block_size
+        config = get_ascend_config()
+        self.use_mqsmla = getattr(config, "enable_sparse_sfa_mqsmla", False)
         self.use_smla = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
         if self.use_smla:
-            config = get_ascend_config()
             self.use_smla = not (config.enable_sparse_sfa_c8 or config.enable_sparse_sfa_turboquant)
         self.block_size = kernel_block_size
         self.table_stride = 1
@@ -277,14 +344,10 @@ class SparseMLAMetadataState:
             max_num_reqs *= 2
         table_rows = max([max_num_reqs + 1, *capture_sizes])
         self.block_table_buffer = torch.empty(table_rows, table_width, dtype=torch.int32, device=device)
-        if self.use_smla:
-            config = vllm_config.model_config.hf_text_config
-            self.num_heads = (
-                config.num_attention_heads // vllm_config.parallel_config.tensor_parallel_size
-                if num_heads is None
-                else num_heads
-            )
-            self.metadata_buffer = torch.empty(SMLA_METADATA_SIZE, dtype=torch.int32, device=device)
+        self.sinks = None
+        if self.use_smla or self.use_mqsmla:
+            metadata_size = SMLA_METADATA_SIZE if self.use_smla else MQSMLA_METADATA_SIZE
+            self.metadata_buffer = torch.empty(metadata_size, dtype=torch.int32, device=device)
             self.length_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 1,
@@ -292,10 +355,15 @@ class SparseMLAMetadataState:
                 device=device,
             )
             self.valid_mask_buffer = torch.empty_like(self.length_buffer, dtype=torch.bool)
+        if self.use_smla:
+            config = vllm_config.model_config.hf_text_config
+            self.num_heads = (
+                config.num_attention_heads // vllm_config.parallel_config.tensor_parallel_size
+                if num_heads is None
+                else num_heads
+            )
             # ACL Graph replay reads the addresses captured on the first run,
             # so every tensor the operator consumes has to outlive the capture.
-            # Allocate the sinks once here, next to the other persistent
-            # operator buffers, and keep it for this state's lifetime.
             self.sinks = torch.full(
                 (self.num_heads,),
                 SMLA_DEFAULT_SINK_VALUE,
@@ -317,7 +385,7 @@ class SparseMLAMetadataState:
             torch.div(expanded[:, :: self.table_stride], self.table_stride, rounding_mode="floor", out=table)
         metadata.block_table = table
         metadata.block_size = self.block_size
-        if self.use_smla:
+        if self.use_smla or self.use_mqsmla:
             positions = metadata.positions
             if positions.numel() > self.length_buffer.shape[0]:
                 raise ValueError("Sparse MLA token count exceeds its persistent top-k buffer.")
@@ -856,7 +924,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
         self.is_kv_consumer = kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
 
-        self.sfa_qsfa_tile_size = SFA_QSFA_TILE_SIZE
+        self.enable_sparse_sfa_mqsmla = getattr(ascend_config, "enable_sparse_sfa_mqsmla", False)
+        self.sfa_qsfa_tile_size = MQSMLA_FP8_GROUP_SIZE if self.enable_sparse_sfa_mqsmla else SFA_QSFA_TILE_SIZE
+        self.sfa_qsfa_scale_dtype = torch.bfloat16 if self.enable_sparse_sfa_mqsmla else torch.float32
         self.sfa_qsfa_packed_kv_head_dim = 0
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
@@ -912,6 +982,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
             )
+        if self.enable_sparse_sfa_mqsmla and self.vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError("MQSMLA quant_mode=4 requires BF16 query and output tensors.")
 
         if self.enable_sparse_sfa_turboquant:
             self.sfa_qsfa_packed_kv_head_dim = get_tq_fused_slot_bytes(self.kv_lora_rank, self.qk_rope_head_dim)
@@ -920,6 +992,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 self.sfa_qsfa_tile_size,
+                self.sfa_qsfa_scale_dtype,
             )
         # Shared signed-Hadamard transform plus the ops-nn quantizer.
         self.turboquant = TurboQuantLatent() if self.enable_sparse_sfa_turboquant else None
@@ -1465,6 +1538,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 epsilon=self.kv_a_layernorm.variance_epsilon,
                 dst_type=self.c8_cache_dtype,
                 tile_size=self.sfa_qsfa_tile_size,
+                scale_dtype=self.sfa_qsfa_scale_dtype,
                 use_rope=self.use_rope,
             )
 
@@ -1824,6 +1898,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             assert self.turboquant is not None
             return self.turboquant.inverse(attn_out)
+        if getattr(self, "enable_sparse_sfa_mqsmla", False):
+            return sparse_mqsmla(ql_nope, kv_cache[0], topk_indices, attn_metadata, self.scale)
         if self.qk_rope_head_dim == 0 and not self.enable_sparse_sfa_c8:
             return sparse_mla(ql_nope, kv_cache[0], topk_indices, attn_metadata, self.scale)
         if self.qk_rope_head_dim == 0:
@@ -2365,6 +2441,7 @@ def custom_kv_rmsnorm_rope(
     epsilon: float = 1e-5,
     dst_type: torch.dtype | int = torch.float8_e4m3fn,
     tile_size: int = SFA_QSFA_TILE_SIZE,
+    scale_dtype: torch.dtype = torch.float32,
     use_rope: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rms_in, rope_in = kv.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
@@ -2380,17 +2457,18 @@ def custom_kv_rmsnorm_rope(
         row_block_size=1,
         col_block_size=tile_size,
     )
+    knope_scale = knope_scale.to(scale_dtype).view(*prefix_shape, -1).contiguous()
     if dst_type == torch.int8:
         # Return byte views so the caller can concatenate all three components.
         return (
             k_rope.contiguous().view(torch.int8) if qk_rope_head_dim else k_nope.new_empty((*prefix_shape, 0)),
             k_nope.view(*prefix_shape, kv_lora_rank),
-            knope_scale.to(torch.float32).view(*prefix_shape, -1).contiguous().view(torch.int8),
+            knope_scale.view(torch.int8),
         )
 
     # A5 transports the BF16 rope and scale bytes through FP8-typed tensors.
     return (
         k_rope.view(torch.float8_e4m3fn),
         k_nope,
-        knope_scale.view(knope_scale.shape[0], -1).view(torch.float8_e4m3fn),
+        knope_scale.view(torch.float8_e4m3fn),
     )

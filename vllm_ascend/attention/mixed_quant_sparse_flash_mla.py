@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapt DSA arguments to the installed MixedQuantSparseFlashMla operators.
 
-Two paths share the MixedQuantSparseFlashMla (cann_ops_transformer) operator:
+Three paths share the MixedQuantSparseFlashMla (cann_ops_transformer) operator:
 
 * TurboQuant (quant_mode=3): ``mixed_quant_sparse_flash_mla_turboquant`` /
   ``mixed_quant_sparse_flash_mla_metadata_turboquant`` (see
@@ -10,6 +10,8 @@ Two paths share the MixedQuantSparseFlashMla (cann_ops_transformer) operator:
 * DSV4 FP8 (quant_mode=1): ``mixed_quant_sparse_flash_mla_fp8`` /
   ``mixed_quant_sparse_flash_mla_metadata_fp8``, adapted from
   the former ``npu_kv_quant_sparse_attn_sharedkv`` path.
+* GLM-Next FP8 C8 (quant_mode=4): ORI-only sparse attention over the full
+  512-dimensional latent KV, using the operator's logical 448+64 split.
 """
 
 from collections.abc import Callable
@@ -34,7 +36,7 @@ def _get_mixed_quant_sparse_flash_mla_ops() -> tuple[Callable, Callable]:
         return namespace.mixed_quant_sparse_flash_mla, namespace.mixed_quant_sparse_flash_mla_metadata
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "DeepSeek V4 TurboQuant requires MixedQuantSparseFlashMla from a matching ops-transformer package."
+            "MixedQuantSparseFlashMla requires a matching CANN ops-transformer package for the selected quant mode."
         ) from exc
 
 
@@ -237,3 +239,51 @@ def mixed_quant_sparse_flash_mla_fp8(q, **kw):
     attention_op, _ = _get_mixed_quant_sparse_flash_mla_ops()
     out, lse = attention_op(q, **kw)
     return out, lse
+
+
+def mixed_quant_sparse_flash_mla_metadata_ori_fp8(**kwargs):
+    kwargs.update(
+        quant_mode=1,
+        rope_head_dim=64,
+        cmp_ratio=1,
+        ori_mask_mode=0,
+        cmp_mask_mode=0,
+        ori_win_left=-1,
+        ori_win_right=-1,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        has_ori_kv=True,
+        has_cmp_kv=False,
+    )
+    kwargs.pop("device", None)
+    _, metadata_op = _get_mixed_quant_sparse_flash_mla_ops()
+    return metadata_op(**kwargs)
+
+
+def mixed_quant_sparse_flash_mla_ori_fp8(q, **kwargs):
+    for name in (
+        "cmp_kv",
+        "cmp_sparse_indices",
+        "cmp_block_table",
+        "cu_seqlens_cmp_kv",
+        "seqused_cmp_kv",
+        "cmp_residual_kv",
+        "cmp_topk_length",
+    ):
+        kwargs.pop(name, None)
+    kwargs.update(
+        quant_mode=4,
+        rope_head_dim=64,
+        cmp_ratio=1,
+        ori_mask_mode=0,
+        cmp_mask_mode=0,
+        ori_win_left=-1,
+        ori_win_right=-1,
+        layout_q="TND",
+        layout_kv="PA_BBND",
+        topk_value_mode=1,
+        return_softmax_lse=False,
+        sinks=None,
+    )
+    attention_op, _ = _get_mixed_quant_sparse_flash_mla_ops()
+    return attention_op(q, **kwargs)

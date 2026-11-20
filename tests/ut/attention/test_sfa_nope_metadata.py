@@ -16,7 +16,14 @@ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 
 
 def _builder(
-    block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAMetadataBuilder, tp_size=1, speculative=False
+    block_size,
+    a5,
+    monkeypatch,
+    rope_dim=0,
+    builder_cls=sfa.AscendSFAMetadataBuilder,
+    tp_size=1,
+    speculative=False,
+    mqsmla=False,
 ):
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
@@ -41,7 +48,11 @@ def _builder(
         lambda: SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.FP8_OPTIMIZED if a5 else None),
     )
     monkeypatch.setattr(sfa, "select_common_block_size", lambda *args: 128)
-    config_flags = SimpleNamespace(enable_sparse_sfa_c8=False, enable_sparse_sfa_turboquant=False)
+    config_flags = SimpleNamespace(
+        enable_sparse_sfa_c8=mqsmla,
+        enable_sparse_sfa_turboquant=False,
+        enable_sparse_sfa_mqsmla=mqsmla,
+    )
     monkeypatch.setattr(sfa, "get_ascend_config", lambda: config_flags)
     monkeypatch.setattr(
         sfa, "AttentionMaskBuilder", lambda device: SimpleNamespace(get_attention_mask=lambda *args: None)
@@ -659,3 +670,60 @@ def test_nope_c8_output_returns_kernel_buffer_without_python_mask(monkeypatch):
             torch.empty(4, 2, 8), None, (cache,), None, metadata, None, None
         )
     assert result is dispatch.return_value
+
+
+def test_mqsmla_nope_metadata_and_indices(monkeypatch):
+    builder = _builder(128, True, monkeypatch, mqsmla=True)
+    first = builder.build(0, _common(128))
+    second = builder.build(0, _common(128))
+    draft = builder.build_for_drafting(_common(128), 1)
+    assert first.smla_metadata.shape == (sfa.MQSMLA_METADATA_SIZE,)
+    assert first.smla_metadata.data_ptr() == second.smla_metadata.data_ptr()
+    assert first.smla_metadata.data_ptr() != draft.smla_metadata.data_ptr()
+    assert first.smla_sinks is None
+
+    plans = []
+
+    def metadata_op(**kwargs):
+        plans.append(kwargs["ori_topk_length"].clone())
+        return torch.zeros(sfa.MQSMLA_METADATA_SIZE, dtype=torch.int32)
+
+    values = torch.tensor([[[3, 1, -1, 9]], [[2, 0, 1, 9]], [[-1, -1, -1, 9]]], dtype=torch.int32)
+    indices = values[..., :3]
+    assert not indices.is_contiguous()
+    query = torch.ones(3, 4, 512, dtype=torch.bfloat16)
+    cache = torch.zeros(2, 128, 1, 544, dtype=torch.uint8)
+
+    def attention_op(q, **kwargs):
+        assert kwargs["ori_sparse_indices"].is_contiguous()
+        torch.testing.assert_close(kwargs["ori_sparse_indices"], indices)
+        assert kwargs["ori_kv"].dtype == torch.uint8
+        assert kwargs["ori_kv"].data_ptr() == cache.data_ptr()
+        assert kwargs["sinks"] is None
+        return (q * 2,)
+
+    monkeypatch.setattr(sfa, "mixed_quant_sparse_flash_mla_metadata_ori_fp8", metadata_op)
+    monkeypatch.setattr(sfa, "mixed_quant_sparse_flash_mla_ori_fp8", attention_op)
+    output = sfa.sparse_mqsmla(query, cache, indices, first, 0.25)
+    torch.testing.assert_close(output, query * 2)
+    torch.testing.assert_close(plans[0][:, 0], torch.tensor([2, 3, 0]))
+
+
+def test_mqsmla_dispatch_is_explicit():
+    impl = object.__new__(sfa.AscendSFAImpl)
+    impl.enable_sparse_sfa_turboquant = False
+    impl.enable_sparse_sfa_mqsmla = True
+    impl.scale = 0.5
+    args = (
+        torch.empty(1, 4, 512),
+        None,
+        (torch.empty(1, 128, 1, 544, dtype=torch.uint8),),
+        torch.empty(1, 1, 4, dtype=torch.int32),
+        SimpleNamespace(),
+        None,
+        None,
+    )
+    with patch.object(sfa, "sparse_mqsmla", return_value=args[0]) as dispatch:
+        result = impl._execute_sparse_flash_attention_process(*args)
+    assert result is args[0]
+    dispatch.assert_called_once_with(args[0], args[2][0], args[3], args[4], impl.scale)

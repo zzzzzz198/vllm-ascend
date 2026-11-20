@@ -521,6 +521,34 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         self.assertEqual(mock_block_quant.call_args.kwargs["row_block_size"], 1)
         self.assertEqual(mock_block_quant.call_args.kwargs["col_block_size"], 128)
 
+    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_dynamic_block_quant", create=True)
+    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_rms_norm", create=True)
+    def test_mqsmla_pack_uses_group32_bf16_scales(self, mock_rms_norm, mock_block_quant):
+        values = torch.randn(2, 512, dtype=torch.bfloat16)
+        quantized = torch.empty(2, 512, dtype=torch.float8_e4m3fn)
+        scales = torch.arange(32, dtype=torch.float32).view(2, 16)
+        mock_rms_norm.return_value = values, None
+        mock_block_quant.return_value = quantized, scales
+
+        rope, nope, scale_bytes = custom_kv_rmsnorm_rope(
+            values,
+            torch.ones(512, dtype=torch.bfloat16),
+            None,
+            None,
+            512,
+            0,
+            tile_size=32,
+            scale_dtype=torch.bfloat16,
+        )
+
+        assert rope.shape[-1] == 0
+        assert nope is quantized
+        assert mock_block_quant.call_args.kwargs["col_block_size"] == 32
+        torch.testing.assert_close(scale_bytes.view(torch.bfloat16), scales.to(torch.bfloat16))
+        assert scale_bytes.shape == (2, 32)
+        assert get_sfa_qsfa_packed_head_dim(512, 0) == 528
+        assert get_sfa_qsfa_packed_head_dim(512, 0, 32, torch.bfloat16) == 544
+
     def test_execute_kv_quant_sparse_flash_attention_vllm(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl.is_kimi_k31 = False

@@ -25,10 +25,12 @@ from vllm.model_executor.models.config import (
 from vllm.platforms.interface import Platform
 
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 from vllm_ascend.models.kimi_k3.kimi_k3 import AscendKimiK3ForConditionalGeneration
 from vllm_ascend.patch.platform.patch_mamba_config import (
     _get_sparse_index_kpool,
     _using_kv_store,
+    _using_sparse_sfa_mqsmla,
 )
 from vllm_ascend.platform import NPUPlatform
 
@@ -64,6 +66,32 @@ def test_sparse_indexer_without_kpool_uses_generic_layout():
     model_config = _model_config(index_topk=2048)
 
     assert _get_sparse_index_kpool(model_config) is None
+
+
+@pytest.mark.parametrize(
+    "enabled,cache_dtype,kpool,a5,expected",
+    [
+        (False, "fp8", True, True, False),
+        (True, "int8", True, True, False),
+        (True, "fp8", False, True, False),
+        (True, "fp8", True, False, False),
+        ("false", "fp8", True, True, False),
+        ("true", "fp8", True, True, True),
+        (True, "fp8", True, True, True),
+    ],
+)
+def test_mqsmla_config_gate_is_model_hardware_and_dtype_specific(enabled, cache_dtype, kpool, a5, expected):
+    model_config = _model_config(index_topk=2048, **({"index_kpool": 4} if kpool else {}))
+    config = SimpleNamespace(
+        additional_config={"enable_sparse_sfa_mqsmla": enabled},
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+    )
+    family = DeviceAdaptorFamily.FP8_OPTIMIZED if a5 else None
+    with patch(
+        "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+        return_value=SimpleNamespace(device_adaptor_family=family),
+    ):
+        assert _using_sparse_sfa_mqsmla(config, model_config) is expected
 
 
 @pytest.mark.parametrize("index_kpool", [None, 0, 1, "4"])
@@ -217,6 +245,43 @@ def test_backend_alignment_preserves_kpool_c8_page_geometry(cache_dtype, prefix_
             assert config.cache_config.block_size // 4 % 16 == 0
             expected_mamba_block_size = runner_block_size if prefix_caching else config.model_config.max_model_len
             assert config.cache_config.mamba_block_size == expected_mamba_block_size
+
+
+def test_kpool_mqsmla_uses_544_byte_hybrid_pages():
+    config = _config(mamba_cache_mode="align")
+    config.additional_config = {"enable_sparse_sfa_mqsmla": True}
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    config.cache_config.cache_dtype = "fp8"
+    config.cache_config.block_size = 128
+    config.cache_config.mamba_page_size_padded = None
+    config.model_config = SimpleNamespace(
+        architecture="DummyHybridModel",
+        use_mla=True,
+        dtype=torch.bfloat16,
+        max_model_len=4096,
+        hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=4, kv_lora_rank=512, qk_rope_head_dim=0),
+        hf_config=SimpleNamespace(),
+        get_num_kv_heads=lambda _parallel_config: 1,
+    )
+    model_cls = SimpleNamespace(
+        get_mamba_state_shape_from_config=lambda _config: ((8, 24576), (64, 128, 128)),
+        get_mamba_state_dtype_from_config=lambda _config: (torch.bfloat16, torch.float32),
+    )
+    with (
+        patch.object(MambaModelConfig, "verify_and_update_config"),
+        patch(
+            "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
+            return_value=(model_cls, None),
+        ),
+        patch(
+            "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
+            return_value=SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.FP8_OPTIMIZED),
+        ),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.block_size == 8448
+    assert config.cache_config.mamba_page_size_padded == 8448 * 544
 
 
 @pytest.mark.parametrize(

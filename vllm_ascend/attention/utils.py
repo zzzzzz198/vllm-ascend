@@ -208,13 +208,14 @@ def get_sfa_qsfa_packed_head_dim(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     tile_size: int = SFA_QSFA_TILE_SIZE,
+    scale_dtype: torch.dtype = torch.float32,
 ) -> int:
     if kv_lora_rank % tile_size != 0:
         raise ValueError(
             f"kv_lora_rank must be divisible by tile_size for SFA QSFA packed cache, "
             f"got {kv_lora_rank=} and {tile_size=}."
         )
-    scale_metadata_bytes = (kv_lora_rank // tile_size) * get_dtype_size(torch.float32)
+    scale_metadata_bytes = (kv_lora_rank // tile_size) * get_dtype_size(scale_dtype)
     return kv_lora_rank + qk_rope_head_dim * get_dtype_size(torch.bfloat16) + scale_metadata_bytes
 
 

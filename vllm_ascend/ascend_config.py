@@ -574,6 +574,7 @@ class AscendConfig:
             "weight_nz_mode": 1,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
+            "enable_sparse_sfa_mqsmla": false,
             "enable_sparse_li_c8": false,
             "enable_sparse_li_c4": false,
             "ascend_compilation_config": {
@@ -776,6 +777,7 @@ class AscendConfig:
     enable_sp_by_pass: bool = False
     enable_sparse_sfa_turboquant: bool = False
     enable_sparse_sfa_c8: bool = False
+    enable_sparse_sfa_mqsmla: bool = False
     enable_sparse_li_c8: bool = False
     enable_sparse_li_c4: bool = False
     pd_tp_ratio: int = 1
@@ -1029,6 +1031,22 @@ class AscendConfig:
         cache_dtype = getattr(cache_config, "cache_dtype", None)
         self.enable_sparse_sfa_turboquant = cache_dtype == "turboquant_4bit_nc" and use_sparse_sfa
         self.enable_sparse_sfa_c8 = vllm_config.cache_config.cache_dtype in ["fp8", "int8"] and use_sparse_sfa
+        if self.enable_sparse_sfa_mqsmla:
+            if not (
+                self.enable_sparse_sfa_c8
+                and cache_dtype == "fp8"
+                and model_uses_kpool_indexer(vc.model_config)
+                and get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+            ):
+                raise ValueError("enable_sparse_sfa_mqsmla requires GLM KeyPool SFA, Ascend 950/A5 and FP8 C8.")
+            text_config = vc.model_config.hf_text_config
+            if text_config.kv_lora_rank != 512 or text_config.qk_rope_head_dim != 0:
+                raise ValueError("enable_sparse_sfa_mqsmla requires kv_lora_rank=512 and qk_rope_head_dim=0.")
+            local_heads = text_config.num_attention_heads // vc.parallel_config.tensor_parallel_size
+            if not 1 <= local_heads <= 64:
+                raise ValueError("MQSMLA quant_mode=4 requires 1 to 64 local query heads.")
+            if vc.parallel_config.decode_context_parallel_size > 1:
+                raise ValueError("enable_sparse_sfa_mqsmla does not support decode context parallelism.")
         self.enable_sparse_li_c8 = vllm_config.attention_config.indexer_kv_dtype in ["fp8", "int8"] and use_sparse
         self.enable_sparse_li_c4 = vllm_config.attention_config.indexer_kv_dtype == "mxfp4" and use_sparse
         if self.enable_sparse_li_c8 and self.enable_sparse_li_c4:

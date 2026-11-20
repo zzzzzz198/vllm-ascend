@@ -2,7 +2,9 @@
 
 import math
 
+import torch
 import vllm.model_executor.models.config
+from pydantic import TypeAdapter
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MambaModelConfig
@@ -37,6 +39,23 @@ def _using_sparse_sfa_c8(vllm_config, model_config) -> bool:
     from vllm_ascend.utils import model_uses_kpool_indexer, model_uses_sfa_sparse
 
     return model_uses_sfa_sparse(model_config) or model_uses_kpool_indexer(model_config)
+
+
+def _using_sparse_sfa_mqsmla(vllm_config, model_config) -> bool:
+    additional_config = getattr(vllm_config, "additional_config", {})
+    if isinstance(additional_config, dict):
+        enabled = additional_config.get("enable_sparse_sfa_mqsmla", False)
+    else:
+        enabled = getattr(additional_config, "enable_sparse_sfa_mqsmla", False)
+    enabled = TypeAdapter(bool).validate_python(enabled)
+    if not enabled or vllm_config.cache_config.cache_dtype != "fp8":
+        return False
+    from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
+    from vllm_ascend.utils import model_uses_kpool_indexer
+
+    return model_uses_kpool_indexer(model_config) and (
+        get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+    )
 
 
 def _using_kv_store(vllm_config) -> bool:
@@ -106,15 +125,16 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
         sfa_c8_packed = model_config.use_mla and _using_sparse_sfa_c8(vllm_config, model_config)
         if sfa_c8_packed:
-            # A C8-packed SFA page holds one token in kv_lora_rank int8 bytes
-            # plus fp32 scale metadata, roughly half the bf16 page. Size the
-            # shared mamba page from the packed page, otherwise it stays at
-            # bf16 geometry and the C8 capacity gain is lost to padding.
+            # Size the shared mamba page from the packed C8 page, otherwise it
+            # stays at bf16 geometry and the C8 capacity gain is lost to padding.
             from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 
+            use_mqsmla = _using_sparse_sfa_mqsmla(vllm_config, model_config)
             attn_token_page_size = get_sfa_qsfa_packed_head_dim(
                 model_config.hf_text_config.kv_lora_rank,
                 model_config.hf_text_config.qk_rope_head_dim,
+                tile_size=32 if use_mqsmla else 128,
+                scale_dtype=torch.bfloat16 if use_mqsmla else torch.float32,
             )
 
         # The compressed indexer storage block is consumed by a CANN kernel
@@ -129,9 +149,9 @@ def verify_and_update_config(cls, vllm_config) -> None:
             # the page-strided KV view gains a per-block hole and the CANN
             # operator's AutoContiguous copies the whole KV pool once per
             # layer per decode step. The covering size is what the alignment
-            # formula derives from min_block_size alone (544 -> 640 for
-            # GLM-5.3-Flash); cap larger requests at it, since they only
-            # coarsen scheduling granularity without adding coverage.
+            # formula derives from min_block_size alone; cap larger requests at
+            # it, since they only coarsen scheduling granularity without adding
+            # coverage.
             c8_block_size = alignment_tokens * cdiv(min_block_size, alignment_tokens)
             attn_block_size = min(attn_block_size, c8_block_size)
         if cache_config.block_size != attn_block_size:
