@@ -69,21 +69,25 @@ def test_sparse_indexer_without_kpool_uses_generic_layout():
 
 
 @pytest.mark.parametrize(
-    "enabled,cache_dtype,kpool,a5,expected",
+    "cache_dtype,kpool,a5,expected",
     [
-        (False, "fp8", True, True, False),
-        (True, "int8", True, True, False),
-        (True, "fp8", False, True, False),
-        (True, "fp8", True, False, False),
-        ("false", "fp8", True, True, False),
-        ("true", "fp8", True, True, True),
-        (True, "fp8", True, True, True),
+        ("int8", True, True, False),
+        ("fp8", False, True, False),
+        ("fp8", True, False, False),
+        ("fp8", True, True, True),
     ],
 )
-def test_mqsmla_config_gate_is_model_hardware_and_dtype_specific(enabled, cache_dtype, kpool, a5, expected):
-    model_config = _model_config(index_topk=2048, **({"index_kpool": 4} if kpool else {}))
+def test_mqsmla_gate_is_model_hardware_and_dtype_specific(cache_dtype, kpool, a5, expected):
+    model_config = _model_config(
+        index_topk=2048,
+        num_attention_heads=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        **({"index_kpool": 4} if kpool else {}),
+    )
+    model_config.dtype = torch.bfloat16
     config = SimpleNamespace(
-        additional_config={"enable_sparse_sfa_mqsmla": enabled},
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, decode_context_parallel_size=1),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
     )
     family = DeviceAdaptorFamily.FP8_OPTIMIZED if a5 else None
@@ -249,8 +253,7 @@ def test_backend_alignment_preserves_kpool_c8_page_geometry(cache_dtype, prefix_
 
 def test_kpool_mqsmla_uses_544_byte_hybrid_pages():
     config = _config(mamba_cache_mode="align")
-    config.additional_config = {"enable_sparse_sfa_mqsmla": True}
-    config.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=1, decode_context_parallel_size=1)
     config.cache_config.cache_dtype = "fp8"
     config.cache_config.block_size = 128
     config.cache_config.mamba_page_size_padded = None
@@ -259,7 +262,13 @@ def test_kpool_mqsmla_uses_544_byte_hybrid_pages():
         use_mla=True,
         dtype=torch.bfloat16,
         max_model_len=4096,
-        hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=4, kv_lora_rank=512, qk_rope_head_dim=0),
+        hf_text_config=SimpleNamespace(
+            index_topk=2048,
+            index_kpool=4,
+            num_attention_heads=4,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+        ),
         hf_config=SimpleNamespace(),
         get_num_kv_heads=lambda _parallel_config: 1,
     )

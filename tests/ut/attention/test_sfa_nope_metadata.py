@@ -51,7 +51,7 @@ def _builder(
     config_flags = SimpleNamespace(
         enable_sparse_sfa_c8=mqsmla,
         enable_sparse_sfa_turboquant=False,
-        enable_sparse_sfa_mqsmla=mqsmla,
+        use_sparse_sfa_mqsmla=mqsmla,
     )
     monkeypatch.setattr(sfa, "get_ascend_config", lambda: config_flags)
     monkeypatch.setattr(
@@ -712,7 +712,7 @@ def test_mqsmla_nope_metadata_and_indices(monkeypatch):
 def test_mqsmla_dispatch_is_explicit():
     impl = object.__new__(sfa.AscendSFAImpl)
     impl.enable_sparse_sfa_turboquant = False
-    impl.enable_sparse_sfa_mqsmla = True
+    impl.use_sparse_sfa_mqsmla = True
     impl.scale = 0.5
     args = (
         torch.empty(1, 4, 512),

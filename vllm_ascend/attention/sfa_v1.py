@@ -328,7 +328,7 @@ class SparseMLAMetadataState:
             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
         self.split = block_size // kernel_block_size
         config = get_ascend_config()
-        self.use_mqsmla = getattr(config, "enable_sparse_sfa_mqsmla", False)
+        self.use_mqsmla = getattr(config, "use_sparse_sfa_mqsmla", False)
         self.use_smla = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
         if self.use_smla:
             self.use_smla = not (config.enable_sparse_sfa_c8 or config.enable_sparse_sfa_turboquant)
@@ -924,9 +924,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
         self.is_kv_consumer = kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
 
-        self.enable_sparse_sfa_mqsmla = getattr(ascend_config, "enable_sparse_sfa_mqsmla", False)
-        self.sfa_qsfa_tile_size = MQSMLA_FP8_GROUP_SIZE if self.enable_sparse_sfa_mqsmla else SFA_QSFA_TILE_SIZE
-        self.sfa_qsfa_scale_dtype = torch.bfloat16 if self.enable_sparse_sfa_mqsmla else torch.float32
+        self.use_sparse_sfa_mqsmla = getattr(ascend_config, "use_sparse_sfa_mqsmla", False)
+        self.sfa_qsfa_tile_size = MQSMLA_FP8_GROUP_SIZE if self.use_sparse_sfa_mqsmla else SFA_QSFA_TILE_SIZE
+        self.sfa_qsfa_scale_dtype = torch.bfloat16 if self.use_sparse_sfa_mqsmla else torch.float32
         self.sfa_qsfa_packed_kv_head_dim = 0
         self.sfa_qsfa_k_nope_clip_alpha: torch.Tensor | None = None
         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
@@ -982,7 +982,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
             )
-        if self.enable_sparse_sfa_mqsmla and self.vllm_config.model_config.dtype != torch.bfloat16:
+        if self.use_sparse_sfa_mqsmla and self.vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError("MQSMLA quant_mode=4 requires BF16 query and output tensors.")
 
         if self.enable_sparse_sfa_turboquant:
@@ -1898,7 +1898,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             assert self.turboquant is not None
             return self.turboquant.inverse(attn_out)
-        if getattr(self, "enable_sparse_sfa_mqsmla", False):
+        if getattr(self, "use_sparse_sfa_mqsmla", False):
             return sparse_mqsmla(ql_nope, kv_cache[0], topk_indices, attn_metadata, self.scale)
         if self.qk_rope_head_dim == 0 and not self.enable_sparse_sfa_c8:
             return sparse_mla(ql_nope, kv_cache[0], topk_indices, attn_metadata, self.scale)

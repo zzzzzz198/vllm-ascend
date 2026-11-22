@@ -4,7 +4,6 @@ import math
 
 import torch
 import vllm.model_executor.models.config
-from pydantic import TypeAdapter
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MambaModelConfig
@@ -42,19 +41,26 @@ def _using_sparse_sfa_c8(vllm_config, model_config) -> bool:
 
 
 def _using_sparse_sfa_mqsmla(vllm_config, model_config) -> bool:
-    additional_config = getattr(vllm_config, "additional_config", {})
-    if isinstance(additional_config, dict):
-        enabled = additional_config.get("enable_sparse_sfa_mqsmla", False)
-    else:
-        enabled = getattr(additional_config, "enable_sparse_sfa_mqsmla", False)
-    enabled = TypeAdapter(bool).validate_python(enabled)
-    if not enabled or vllm_config.cache_config.cache_dtype != "fp8":
+    if vllm_config.cache_config.cache_dtype != "fp8":
         return False
     from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
     from vllm_ascend.utils import model_uses_kpool_indexer
 
-    return model_uses_kpool_indexer(model_config) and (
-        get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+    if not model_uses_kpool_indexer(model_config) or (
+        get_current_hardware_profile().device_adaptor_family != DeviceAdaptorFamily.FP8_OPTIMIZED
+    ):
+        return False
+    text_config = getattr(model_config, "hf_text_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    num_heads = getattr(text_config, "num_attention_heads", None)
+    tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
+    local_heads = num_heads // tensor_parallel_size if num_heads is not None else 0
+    return bool(
+        getattr(text_config, "kv_lora_rank", None) == 512
+        and getattr(text_config, "qk_rope_head_dim", None) == 0
+        and model_config.dtype == torch.bfloat16
+        and 1 <= local_heads <= 64
+        and getattr(parallel_config, "decode_context_parallel_size", 1) == 1
     )
 
 
