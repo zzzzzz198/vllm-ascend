@@ -129,10 +129,11 @@ def test_row_shard_slices_tile_rows_and_rebase_requests():
     tp_size = 4
     common = _common_metadata(query_lens, seq_lens)
     builder = _builder(tp_size=tp_size)
+    pool_key_block_table = common.block_table_tensor + 1000
     covered = []
     for rank in range(tp_size):
         with patch(f"{MODULE}.get_tensor_model_parallel_rank", return_value=rank):
-            shard = builder._build_indexer_row_shard(common, graph_capture=False)
+            shard = builder._build_indexer_row_shard(common, graph_capture=False, block_table=pool_key_block_table)
         assert shard is not None
         assert shard.sizes[rank] == shard.stop - shard.start
         covered.append((shard.start, shard.stop))
@@ -146,7 +147,7 @@ def test_row_shard_slices_tile_rows_and_rebase_requests():
         local_rows = int(shard.cum_query_lens[-1])
         for position in (shard.positions[0], shard.positions[-1]):
             request = int(torch.searchsorted(common.query_start_loc_cpu[1:], position + 1))
-            assert common.block_table_tensor[request] in shard.block_table
+            assert pool_key_block_table[request] in shard.block_table
         assert local_rows == sum(int(b) - int(a) for a, b in zip([0, *shard.cum_query_lens[:-1]], shard.cum_query_lens))
     covered.sort()
     assert [start for start, _ in covered] == [0, *[stop for _, stop in covered][:-1]]
@@ -162,9 +163,9 @@ def test_row_shard_rebases_a_request_cut_midway():
     common = _common_metadata([rows], [total_len])
     builder = _builder(tp_size=2)
     with patch(f"{MODULE}.get_tensor_model_parallel_rank", return_value=0):
-        head = builder._build_indexer_row_shard(common, graph_capture=False)
+        head = builder._build_indexer_row_shard(common, graph_capture=False, block_table=common.block_table_tensor)
     with patch(f"{MODULE}.get_tensor_model_parallel_rank", return_value=1):
-        tail = builder._build_indexer_row_shard(common, graph_capture=False)
+        tail = builder._build_indexer_row_shard(common, graph_capture=False, block_table=common.block_table_tensor)
     assert head is not None and tail is not None
     # Contiguous tiling; the boundary follows the cost ramp, not row parity.
     assert head.start == 0 and tail.stop == rows and head.stop == tail.start
@@ -315,7 +316,7 @@ def test_row_shard_falls_back_when_cpu_mirrors_absent():
     common.seq_lens_cpu = None
     common._seq_lens_cpu = None
     with patch(f"{MODULE}.get_tensor_model_parallel_rank", return_value=0):
-        shard = _builder()._build_indexer_row_shard(common, graph_capture=False)
+        shard = _builder()._build_indexer_row_shard(common, graph_capture=False, block_table=common.block_table_tensor)
     assert shard is not None
     local_rows = shard.stop - shard.start
     rank0_visible = total_len - rows + local_rows
@@ -353,4 +354,4 @@ def test_build_indexer_row_shard_declines_below_floor():
     """Below the row floor planning is a no-op and the replicated path stays
     untouched."""
     short = _common_metadata([16], [16])
-    assert _builder()._build_indexer_row_shard(short, graph_capture=False) is None
+    assert _builder()._build_indexer_row_shard(short, graph_capture=False, block_table=short.block_table_tensor) is None

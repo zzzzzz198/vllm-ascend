@@ -239,12 +239,12 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
     assert page_rows * tail.shape[-1] == tail.stride(0)
 
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache(indexer_name, specs[indexer_name], raw, backend, 128)
+    keys, scales = view_compressed_indexer_cache(indexer_name, specs[indexer_name], raw, backend)
     page_bytes = descriptor.size // plan.num_blocks
-    assert keys.shape == (15, 32, 1, 128)
-    assert scales.shape == (15, 32, 1, 1)
-    assert keys.stride(0) == scales.stride(0) * scales.element_size() == page_bytes // 5
-    assert scales.data_ptr() - keys.data_ptr() == 32 * 128
+    assert keys.shape == (3, 160, 1, 128)
+    assert scales.shape == (3, 160, 1, 1)
+    assert keys.stride(0) == scales.stride(0) * scales.element_size() == page_bytes
+    assert scales.data_ptr() - keys.data_ptr() == 160 * 128
     assert page_bytes == 25600
 
 

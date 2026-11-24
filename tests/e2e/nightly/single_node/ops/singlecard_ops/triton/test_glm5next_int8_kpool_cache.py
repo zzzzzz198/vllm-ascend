@@ -33,8 +33,8 @@ def test_int8_key_scale_write_preserves_padding_and_invalid_slots(use_graph):
     raw = torch.full((2 * spec.page_size_bytes,), 77, dtype=torch.uint8, device="npu")
     expected_raw = raw.clone()
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    cache, scales = view_compressed_indexer_cache("test", spec, raw, backend, 128)
-    expected_cache, expected_scales = view_compressed_indexer_cache("expected", spec, expected_raw, backend, 128)
+    cache, scales = view_compressed_indexer_cache("test", spec, raw, backend)
+    expected_cache, expected_scales = view_compressed_indexer_cache("expected", spec, expected_raw, backend)
     pooled = torch.arange(6 * 128, device="npu").reshape(6, 128).remainder(127).to(torch.int8)
     pooled[1].zero_()
     pooled_scales = torch.tensor([1, 0.125, 0.25, 0.5, 2, 4], dtype=torch.float16, device="npu")
@@ -73,7 +73,7 @@ def test_int8_key_scale_write_preserves_padding_and_invalid_slots(use_graph):
         if 0 <= slot < 64:
             expected_cache[slot // 32, slot % 32, 0].copy_(pooled[row])
             expected_scales[slot // 32, slot % 32, 0, 0].copy_(pooled_scales[row])
-    # Whole-page comparison includes the interleaved scales and untouched padding.
+    # Whole-page comparison includes the scale region and untouched padding.
     torch.testing.assert_close(raw.cpu(), expected_raw.cpu(), rtol=0, atol=0)
 
 
@@ -95,7 +95,7 @@ def test_int8_operator_reads_managed_pages(use_graph):
     )
     raw = torch.zeros(20 * spec.page_size_bytes, dtype=torch.uint8, device="npu")
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache("operator", spec, raw, backend, 128)
+    keys, scales = view_compressed_indexer_cache("operator", spec, raw, backend)
     torch.manual_seed(1024)
     keys.copy_(torch.randint(-127, 128, keys.shape, device="npu", dtype=torch.int8))
     scales.copy_(torch.rand(scales.shape, device="npu") * 0.01 + 0.001)

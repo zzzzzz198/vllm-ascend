@@ -77,17 +77,18 @@ def test_key_and_scale_share_transferable_pages(blocks_per_page):
     )
     raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8)
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache("indexer", spec, raw, backend, 128)
-    assert keys.shape == (2 * blocks_per_page, 32, 1, 128)
-    assert scales.shape == (2 * blocks_per_page, 32, 1, 1)
-    assert keys.stride(0) == scales.stride(0) * 2 == 8192
+    keys, scales = view_compressed_indexer_cache("indexer", spec, raw, backend)
+    indexer_block_size = 32 * blocks_per_page
+    assert keys.shape == (2, indexer_block_size, 1, 128)
+    assert scales.shape == (2, indexer_block_size, 1, 1)
+    assert keys.stride(0) == scales.stride(0) * 2 == 8192 * blocks_per_page
     keys.fill_(23)
     scales.fill_(0.125)
     # Simulate transporting a complete scheduler page, including all scales.
     destination = torch.zeros_like(raw)
     destination[: spec.page_size_bytes].copy_(raw[: spec.page_size_bytes])
-    k2, s2 = view_compressed_indexer_cache("destination", spec, destination, backend, 128)
-    torch.testing.assert_close(k2[:blocks_per_page], keys[:blocks_per_page])
-    torch.testing.assert_close(s2[:blocks_per_page], scales[:blocks_per_page])
-    assert torch.count_nonzero(k2[blocks_per_page:]) == 0
-    assert torch.count_nonzero(s2[blocks_per_page:]) == 0
+    k2, s2 = view_compressed_indexer_cache("destination", spec, destination, backend)
+    torch.testing.assert_close(k2[:1], keys[:1])
+    torch.testing.assert_close(s2[:1], scales[:1])
+    assert torch.count_nonzero(k2[1:]) == 0
+    assert torch.count_nonzero(s2[1:]) == 0

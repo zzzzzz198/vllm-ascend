@@ -266,20 +266,21 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
         block_table_tensor=expanded,
     )
     first, draft = [builder.build(0, common) for builder in builders]
-    # Kernel-granularity blocks: the metadata reports the natural kernel rows
-    # (128 tokens / pool ratio) and passes the common expanded table through
-    # as a view, so both builders observe the same persistent buffer.
-    assert first.block_size == 128 // pool_size
-    torch.testing.assert_close(first.block_table, expanded)
+    assert first.block_size == storage_block_size
+    torch.testing.assert_close(first.block_table, pages)
+    torch.testing.assert_close(draft.block_table, pages)
     assert first.slot_mapping.shape == (4,)
     assert first.seq_lens.shape == (1,)
     address = first.block_table.data_ptr()
-    assert draft.block_table.data_ptr() == address
+    if split == 1:
+        assert draft.block_table.data_ptr() == address
     common.block_table_tensor[:, :split] = 3 * split + torch.arange(split)
-    refreshed = builders[0].build(0, common)
+    refreshed, refreshed_draft = [builder.build(0, common) for builder in builders]
+    expected_pages = pages.clone()
+    expected_pages[0, 0] = 3
     assert refreshed.block_table.data_ptr() == address
-    torch.testing.assert_close(refreshed.block_table, common.block_table_tensor[:1])
-    torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
+    torch.testing.assert_close(refreshed.block_table, expected_pages)
+    torch.testing.assert_close(refreshed_draft.block_table, expected_pages)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

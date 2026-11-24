@@ -1889,7 +1889,6 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec,
                     raw_cache,
                     group.backend,
-                    kernel_block_size * get_kv_cache_compression_ratio(kv_cache_spec),
                 )
                 continue
             if isinstance(kv_cache_spec, MambaSpec):

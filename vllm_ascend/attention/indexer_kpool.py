@@ -249,6 +249,7 @@ class _KPoolMetadataBuffers:
     start_offsets: torch.Tensor
     token_indices: torch.Tensor
     pooled_slot_mapping: torch.Tensor
+    block_table: torch.Tensor
 
 
 class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
@@ -294,8 +295,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
                 f"kernel block size: logical={self.logical_block_size}, "
                 f"kernel={GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE}."
             )
-        self.kernel_row_block_size = GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE // self.compress_ratio
-        # MTP tables count expanded kernel pages.
+        self.kernel_row_block_size = self.logical_block_size // self.compress_ratio
+        # The shared main-SFA table uses 128-token kernel pages. PoolKeyIndexer
+        # consumes the original logical pages and collapses this expansion.
         self.kernel_blocks_per_logical_block = self.logical_block_size // GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE
         scheduler_config = vllm_config.scheduler_config
         # Builders also run in CPU unit tests without the distributed runtime;
@@ -328,7 +330,10 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         )
 
     def _build_indexer_row_shard(
-        self, common_attn_metadata: CommonAttentionMetadata, graph_capture: bool
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        graph_capture: bool,
+        block_table: torch.Tensor,
     ) -> AscendIndexerKPoolRowShard | None:
         """Plan this rank's cost-balanced contiguous slice of the query rows.
 
@@ -383,9 +388,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         # visible token count; earlier rows follow from CANN's causal mask.
         local_visible = seq_lens_cpu[active] - (query_lens_cpu[active] - local_stops[active]).clamp(min=0)
         active_indices = torch.nonzero(active, as_tuple=False).flatten()
-        block_table = common_attn_metadata.block_table_tensor[:num_reqs].index_select(
-            0, active_indices.to(common_attn_metadata.block_table_tensor.device)
-        )
+        block_table = block_table.index_select(0, active_indices.to(block_table.device))
         return AscendIndexerKPoolRowShard(
             start=start,
             stop=stop,
@@ -406,6 +409,8 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         if buffers is None:
             reqs = self._max_num_metadata_reqs
             tokens = self._max_num_write_tokens if write else self._max_num_batched_tokens
+            split = self.kernel_blocks_per_logical_block
+            table_width = (common_attn_metadata.block_table_tensor.shape[1] + split - 1) // split
             buffers = _KPoolMetadataBuffers(
                 slot_mapping=torch.empty(tokens, dtype=torch.int64, device=self.device),
                 seq_lens=torch.empty(reqs, dtype=torch.int64, device=self.device),
@@ -418,6 +423,11 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
                 start_offsets=torch.empty(reqs, dtype=torch.int32, device=self.device),
                 token_indices=torch.arange(tokens, dtype=torch.int32, device=self.device),
                 pooled_slot_mapping=torch.empty(tokens + 1, dtype=torch.int64, device=self.device),
+                block_table=torch.empty(
+                    (reqs, table_width),
+                    dtype=common_attn_metadata.block_table_tensor.dtype,
+                    device=self.device,
+                ),
             )
             metadata_buffers[key] = buffers
         return buffers
@@ -462,7 +472,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         graph_capture = kwargs.pop("_graph_capture", False)
         del common_prefix_len, fast_build
         metadata = self._build_metadata(common_attn_metadata, graph_capture)
-        metadata.indexer_row_shard = self._build_indexer_row_shard(common_attn_metadata, graph_capture)
+        metadata.indexer_row_shard = self._build_indexer_row_shard(
+            common_attn_metadata, graph_capture, metadata.block_table
+        )
         pcp_context = common_attn_metadata.pcp_context
         if pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any()):
             cache_group_idx = common_attn_metadata.pcp_cache_group_idx
@@ -520,7 +532,13 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             self.logical_block_size,
             self.compress_ratio,
         )
-        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        source_block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        split = self.kernel_blocks_per_logical_block
+        if split == 1:
+            block_table = source_block_table
+        else:
+            block_table = buffers.block_table[:num_reqs, : source_block_table[:, ::split].shape[1]]
+            torch.div(source_block_table[:, ::split], split, rounding_mode="floor", out=block_table)
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
