@@ -5,6 +5,7 @@
 from collections.abc import Callable
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
@@ -55,6 +56,7 @@ def view_compressed_indexer_cache(
     kv_cache_spec: AscendMLAAttentionSpec,
     raw_cache: torch.Tensor | tuple[torch.Tensor, ...],
     attn_backend: AttentionBackend,
+    logical_block_size: int,
 ) -> tuple[torch.Tensor, ...]:
     if isinstance(raw_cache, tuple):
         if len(raw_cache) != 1:
@@ -63,11 +65,18 @@ def view_compressed_indexer_cache(
     else:
         raw_single = raw_cache
     compression_ratio = get_kv_cache_compression_ratio(kv_cache_spec)
-    indexer_kernel_block_size = kv_cache_spec.block_size // compression_ratio
+    indexer_kernel_block_size = logical_block_size // compression_ratio
+    storage_block_size = get_storage_block_size(kv_cache_spec)
+    if indexer_kernel_block_size <= 0 or storage_block_size % indexer_kernel_block_size:
+        raise ValueError(
+            f"Compressed indexer block size for {layer_name} must divide the storage block size: "
+            f"indexer={indexer_kernel_block_size}, storage={storage_block_size}."
+        )
     num_blocks = raw_single.numel() // kv_cache_spec.page_size_bytes
+    num_blocks_per_kv_block = storage_block_size // indexer_kernel_block_size
     shape = tuple(
         attn_backend.get_kv_cache_shape(
-            num_blocks,
+            num_blocks * num_blocks_per_kv_block,
             indexer_kernel_block_size,
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
@@ -76,13 +85,17 @@ def view_compressed_indexer_cache(
     strides = _row_major_strides(shape)
     typed_slot = raw_single.view(kv_cache_spec.dtype)
     if kv_cache_spec.scale_dim:
-        # Each logical page holds one contiguous K region followed by scales.
-        page_bytes = kv_cache_spec.page_size_bytes
+        # Each operator block holds a contiguous K region followed by scales.
+        page_bytes = kv_cache_spec.page_size_bytes // num_blocks_per_kv_block
         key_bytes = strides[0] * get_dtype_size(kv_cache_spec.dtype)
         scale_shape = (*shape[:-1], kv_cache_spec.scale_dim)
         scale_strides = _row_major_strides(scale_shape)
         scale_bytes = scale_strides[0] * get_dtype_size(kv_cache_spec.scale_dtype)
-        if page_bytes < key_bytes + scale_bytes or page_bytes % get_dtype_size(kv_cache_spec.scale_dtype):
+        if (
+            kv_cache_spec.page_size_bytes % num_blocks_per_kv_block
+            or page_bytes < key_bytes + scale_bytes
+            or page_bytes % get_dtype_size(kv_cache_spec.scale_dtype)
+        ):
             raise ValueError(f"Compressed indexer key and scale for {layer_name} do not fit aligned kernel pages.")
         strides[0] = page_bytes // get_dtype_size(kv_cache_spec.dtype)
         scale_strides[0] = page_bytes // get_dtype_size(kv_cache_spec.scale_dtype)
@@ -153,7 +166,13 @@ def view_glm5_next_cache(
         kv_cache_spec, "indexes_kv_by_block_stride", False
     ):
         if get_kv_cache_compression_ratio(kv_cache_spec) > 1:
-            return view_compressed_indexer_cache(layer_name, kv_cache_spec, raw_cache, attn_backend)
+            return view_compressed_indexer_cache(
+                layer_name,
+                kv_cache_spec,
+                raw_cache,
+                attn_backend,
+                get_current_vllm_config().cache_config.block_size,
+            )
         _k_dim, v_dim = get_kv_cache_dims(layer_name, kv_cache_spec)
         if v_dim == 0:
             return _view_nope_main_mla_cache(kv_cache_spec, raw_cache, attn_backend, kernel_block_size)

@@ -1889,6 +1889,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec,
                     raw_cache,
                     group.backend,
+                    vllm_config.cache_config.block_size,
                 )
                 continue
             if isinstance(kv_cache_spec, MambaSpec):

@@ -77,7 +77,7 @@ def test_key_and_scale_share_transferable_pages(blocks_per_page):
     )
     raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8)
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache("indexer", spec, raw, backend)
+    keys, scales = view_compressed_indexer_cache("indexer", spec, raw, backend, 128 * blocks_per_page)
     indexer_block_size = 32 * blocks_per_page
     assert keys.shape == (2, indexer_block_size, 1, 128)
     assert scales.shape == (2, indexer_block_size, 1, 1)
@@ -87,8 +87,29 @@ def test_key_and_scale_share_transferable_pages(blocks_per_page):
     # Simulate transporting a complete scheduler page, including all scales.
     destination = torch.zeros_like(raw)
     destination[: spec.page_size_bytes].copy_(raw[: spec.page_size_bytes])
-    k2, s2 = view_compressed_indexer_cache("destination", spec, destination, backend)
+    k2, s2 = view_compressed_indexer_cache("destination", spec, destination, backend, 128 * blocks_per_page)
     torch.testing.assert_close(k2[:1], keys[:1])
     torch.testing.assert_close(s2[:1], scales[:1])
     assert torch.count_nonzero(k2[1:]) == 0
     assert torch.count_nonzero(s2[1:]) == 0
+
+
+def test_scaled_spec_preserves_requested_indexer_block_size():
+    spec = AscendMLAAttentionSpec(
+        block_size=8704,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.int8,
+        scale_dim=1,
+        scale_dtype=torch.float16,
+        model_version="glm5_next",
+        tokens_per_state=4,
+        indexes_kv_by_block_stride=True,
+        page_size_padded=282880,
+    )
+    raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8)
+    backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
+    keys, scales = view_compressed_indexer_cache("indexer", spec, raw, backend, 512)
+    assert keys.shape == (34, 128, 1, 128)
+    assert scales.shape == (34, 128, 1, 1)
+    assert keys.stride(0) == scales.stride(0) * 2 == 16640
