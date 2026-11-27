@@ -15,15 +15,41 @@ import vllm_ascend.attention.sfa_v1 as sparse_mla
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 
 
+def _kpool_indexer(pool_size=16, topk=2048):
+    indexer = SimpleNamespace(topk_output_width=topk + pool_size - 1)
+
+    def get_topk_lengths(positions):
+        visible = (positions + 1).clamp_min(0)
+        history = (visible // pool_size * pool_size).clamp(max=topk)
+        return history + visible % pool_size
+
+    indexer.get_topk_lengths = get_topk_lengths
+    return indexer
+
+
 def _builder(
-    block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAMetadataBuilder, tp_size=1, speculative=False
+    block_size,
+    a5,
+    monkeypatch,
+    rope_dim=0,
+    builder_cls=sfa.AscendSFAMetadataBuilder,
+    tp_size=1,
+    speculative=False,
+    kpool=None,
 ):
+    indexer = _kpool_indexer(kpool) if kpool is not None else None
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         model_config=SimpleNamespace(
             max_model_len=max(4096, block_size + 2),
             get_head_size=lambda: 512,
-            hf_text_config=SimpleNamespace(num_attention_heads=4, kv_lora_rank=512),
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=4,
+                kv_lora_rank=512,
+                index_kpool=kpool,
+                index_topk=2048,
+                index_share_for_mtp_iteration=kpool is not None,
+            ),
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp_size, prefill_context_parallel_size=1, pcp_shard_decode_requests=False
@@ -32,7 +58,9 @@ def _builder(
         speculative_config=SimpleNamespace(num_speculative_tokens=5) if speculative else None,
         compilation_config=SimpleNamespace(
             cudagraph_capture_sizes=[32] if speculative else [],
-            static_forward_context={"layer": SimpleNamespace(qk_rope_head_dim=rope_dim)},
+            static_forward_context={
+                "layer": SimpleNamespace(qk_rope_head_dim=rope_dim, impl=SimpleNamespace(indexer=indexer))
+            },
         ),
     )
     monkeypatch.setattr(
@@ -137,6 +165,107 @@ def test_shared_sfa_nope_metadata_pages_and_draft_buffers(monkeypatch, block_siz
         assert smaller.smla_valid_mask.data_ptr() == first.smla_valid_mask.data_ptr()
         torch.testing.assert_close(smaller.smla_valid_mask[:, 0], torch.tensor([True, False, False, False]))
         torch.testing.assert_close(draft.smla_valid_mask[:, 0], torch.tensor([True, True, True, False]))
+
+
+def test_kpool_plan_is_built_once_and_reused_across_layers(monkeypatch):
+    builder = _builder(128, True, monkeypatch, kpool=16)
+    common = _common(128)
+    common.positions = torch.tensor([31, 32, 0, 0])
+    planned = []
+
+    def plan(**kwargs):
+        planned.append((kwargs["ori_topk"], kwargs["ori_topk_length"].clone()))
+        return torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32)
+
+    monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
+    metadata = builder.build(0, common)
+    expected = torch.tensor([[32], [33], [1], [0]], dtype=torch.int32)
+    assert metadata.smla_plan_prebuilt
+    assert len(planned) == 1
+    assert planned[0][0] == 2063
+    torch.testing.assert_close(planned[0][1], expected)
+
+    query = torch.ones(4, 4, 512)
+    cache = torch.zeros(1, 128, 1, 512)
+    indices = torch.full((4, 1, 2063), -1, dtype=torch.int32)
+    indices[0, 0, :32] = 0
+    indices[1, 0, :33] = 1
+    indices[2, 0, 0] = 0
+    monkeypatch.setattr(sparse_mla, "_get_sparse_flash_mla_ops", lambda: (lambda q, **kwargs: (q,), None))
+    monkeypatch.setattr(sparse_mla, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False, capturing=False))
+    monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: SimpleNamespace(is_draft_model=False))
+    for _ in range(2):
+        torch.testing.assert_close(sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5), query)
+
+    assert len(planned) == 1
+    torch.testing.assert_close(metadata.smla_topk_length, expected)
+
+
+def test_kpool_draft_plans_use_compacted_source_positions(monkeypatch):
+    builder = _builder(128, True, monkeypatch, kpool=16)
+    planned = []
+
+    def plan(**kwargs):
+        planned.append(kwargs["ori_topk_length"].clone())
+        return torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32)
+
+    monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
+    metadata_by_step = {}
+    for step in (1, 2):
+        common = _common(128)
+        common.positions = torch.tensor([31 + step, 32 + step, step, 0])
+        common.copy_sfa_draft_index = step
+        metadata_by_step[step] = builder.build(0, common)
+
+    expected = torch.tensor([[32], [33], [1], [0]], dtype=torch.int32)
+    assert len(planned) == 2
+    for lengths in planned:
+        torch.testing.assert_close(lengths, expected)
+    assert metadata_by_step[1].smla_metadata.data_ptr() != metadata_by_step[2].smla_metadata.data_ptr()
+    assert metadata_by_step[1].smla_topk_length.data_ptr() != metadata_by_step[2].smla_topk_length.data_ptr()
+
+    query = torch.ones(4, 4, 512)
+    cache = torch.zeros(1, 128, 1, 512)
+    indices = torch.full((4, 1, 2063), -1, dtype=torch.int32)
+    indices[0, 0, :32] = 0
+    indices[1, 0, :33] = 1
+    indices[2, 0, 0] = 0
+    monkeypatch.setattr(sparse_mla, "_get_sparse_flash_mla_ops", lambda: (lambda q, **kwargs: (q,), None))
+    monkeypatch.setattr(sparse_mla, "_EXTRA_CTX", SimpleNamespace(is_draft_model=True, capturing=False))
+    monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: SimpleNamespace(is_draft_model=True))
+    for metadata in metadata_by_step.values():
+        torch.testing.assert_close(sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5), query)
+    assert len(planned) == 2
+
+
+def test_kpool_draft_without_index_sharing_uses_current_positions(monkeypatch):
+    builder = _builder(128, True, monkeypatch, kpool=16)
+    builder.vllm_config.model_config.hf_text_config.index_share_for_mtp_iteration = False
+    common = _common(128)
+    common.positions = torch.tensor([33, 34, 2, 0])
+    common.copy_sfa_draft_index = 2
+    planned = []
+
+    def plan(**kwargs):
+        planned.append(kwargs["ori_topk_length"].clone())
+        return torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32)
+
+    monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
+    metadata = builder.build(0, common)
+    assert metadata.smla_plan_prebuilt
+    torch.testing.assert_close(planned[0], torch.tensor([[34], [35], [3], [0]], dtype=torch.int32))
+
+
+def test_reused_topk_indices_are_sliced_to_logical_width():
+    impl = object.__new__(sfa.AscendSFAImpl)
+    impl.topk_indices_buffer = torch.full((2, 2176), 7, dtype=torch.int32)
+    impl.has_indexer = True
+    impl.indexer = SimpleNamespace(topk_output_width=2063)
+
+    indices = impl._get_indexcache_topk_indices(2)
+    assert indices.shape == (2, 1, 2063)
+    assert indices.data_ptr() == impl.topk_indices_buffer.data_ptr()
+    assert (indices == 7).all()
 
 
 @pytest.mark.parametrize("pcp_size", [1, 8])
@@ -407,6 +536,7 @@ def test_a5_smla_rebuilds_plan_for_a_trimmed_query(monkeypatch):
         smla_topk_length=torch.full((4, 1), 3, dtype=torch.int32),
         smla_valid_mask=torch.tensor([[True], [False], [False], [False]]),
         smla_sinks=torch.ones(2, dtype=torch.float32),
+        smla_plan_prebuilt=True,
         block_size=8,
         num_actual_tokens=1,
     )
@@ -456,6 +586,7 @@ def test_a5_smla_rebuilds_plan_for_the_draft_model(monkeypatch):
         smla_topk_length=torch.full((2, 1), 3, dtype=torch.int32),
         smla_valid_mask=torch.ones(2, 1, dtype=torch.bool),
         smla_sinks=torch.ones(2, dtype=torch.float32),
+        smla_plan_prebuilt=True,
         block_size=8,
         num_actual_tokens=2,
     )
@@ -475,7 +606,16 @@ def test_a5_smla_rebuilds_plan_for_the_draft_model(monkeypatch):
 
     monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
     monkeypatch.setattr(sparse_mla, "_get_sparse_flash_mla_ops", lambda: (smla, None))
-    monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: SimpleNamespace(is_draft_model=True))
+    monkeypatch.setattr(
+        sparse_mla,
+        "_EXTRA_CTX",
+        SimpleNamespace(is_draft_model=True, capturing=True),
+    )
+    monkeypatch.setattr(
+        sparse_mla,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=sfa.CUDAGraphMode.NONE),
+    )
     # query rows == topk_length rows: the shape check alone cannot detect the
     # stale plan.
     query = torch.ones(2, 2, 8, dtype=torch.bfloat16)

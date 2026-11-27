@@ -573,6 +573,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         offload_kwargs = self._sparse_kv_offload_metadata.build_kwargs(
             self.input_batch, self.model_state, num_reqs, batch_desc, query_start_loc_np, step
         )
+        offload_kwargs = {"copy_sfa_draft_index": step, **(offload_kwargs or {})}
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,

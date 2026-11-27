@@ -327,7 +327,7 @@ def test_build_uniform_attn_metadata_sets_decode_only():
         patch(
             "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator.build_attn_metadata_factory",
             return_value=nullcontext(),
-        ),
+        ) as factory,
         patch.object(
             TargetDependentARSpeculator,
             "_build_attn_metadata",
@@ -344,6 +344,7 @@ def test_build_uniform_attn_metadata_sets_decode_only():
 
     assert result == {"draft": metadata}
     assert metadata.attn_state == AscendAttentionState.DecodeOnly
+    assert factory.call_args.kwargs["offload_kwargs"] == {"copy_sfa_draft_index": 1}
     speculator._sparse_kv_offload_metadata.build_kwargs.assert_called_once()
     speculator._update_decode_attn_metadata.assert_called_once_with(
         {"draft": metadata},
@@ -398,7 +399,7 @@ def test_build_attn_metadata_sets_decode_only():
 
 
 def test_build_attn_metadata_delegates_offload_kwargs_once():
-    """Pass the helper's exact result to the factory before the parent build."""
+    """Preserve offload tensors and the draft step before the parent build."""
     speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
     offload_kwargs = {"req_ids_tensor": torch.tensor([7, 8]), "copy_sfa_draft_index": 1}
     calls = []
@@ -409,7 +410,9 @@ def test_build_attn_metadata_delegates_offload_kwargs_once():
 
     def factory(*args, **kwargs):
         calls.append("factory")
-        assert kwargs["offload_kwargs"] is offload_kwargs
+        actual = kwargs["offload_kwargs"]
+        assert actual["copy_sfa_draft_index"] == 1
+        torch.testing.assert_close(actual["req_ids_tensor"], offload_kwargs["req_ids_tensor"])
         return nullcontext()
 
     def parent(*args, **kwargs):

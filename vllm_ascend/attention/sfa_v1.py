@@ -198,29 +198,43 @@ def sparse_mla(query, cache, indices, metadata, scale, *, hif8_scales=None):
         sorted_indices = torch.where(sorted_indices == sentinel, -1, sorted_indices)
         if metadata.smla_sinks is None:
             raise RuntimeError("Sparse MLA requires persistent sinks owned by SparseMLAMetadataState.")
-        # MTP and shared indexers can reuse selections while positions advance.
-        # Count the actual left-aligned prefix on every call, including target
-        # FULL graphs whose query shape still matches the metadata capacity.
         topk_length = metadata.smla_topk_length[: query.shape[0]]
-        metadata.smla_topk_length.zero_()
-        # The builder refreshes this persistent mask outside graph capture.
-        # A Python token count used here would freeze at the captured batch size.
-        valid = metadata.smla_valid_mask[: query.shape[0]]
-        topk_length.copy_((sorted_indices >= 0).sum(dim=-1, dtype=torch.int32).masked_fill(~valid, 0))
         cu_seqlens_q = metadata.query_start_loc
-        if query.shape[0] != metadata.smla_topk_length.shape[0]:
-            # Eager and piecewise execution trim graph-padding query rows.
-            cu_seqlens_q = cu_seqlens_q.clamp(max=query.shape[0])
-        plan = build_smla_metadata(
-            metadata,
-            metadata.smla_metadata,
-            query.shape[1],
-            query.shape[2],
-            sorted_indices.shape[-1],
-            cu_seqlens_q,
-            topk_length,
-            hif8=hif8,
+        use_prebuilt_plan = (
+            getattr(metadata, "smla_plan_prebuilt", False)
+            and not hif8
+            and query.shape[0] == metadata.smla_topk_length.shape[0]
         )
+        if use_prebuilt_plan:
+            # FULL draft replay does not rerun the builder, so capture dynamic planning instead.
+            use_prebuilt_plan = not (
+                _EXTRA_CTX.is_draft_model
+                and (
+                    _EXTRA_CTX.capturing
+                    or getattr(get_forward_context(), "cudagraph_runtime_mode", None) == CUDAGraphMode.FULL
+                )
+            )
+        if use_prebuilt_plan:
+            plan = metadata.smla_metadata
+        else:
+            metadata.smla_topk_length.zero_()
+            # The builder refreshes this persistent mask outside graph capture.
+            # A Python token count used here would freeze at the captured batch size.
+            valid = metadata.smla_valid_mask[: query.shape[0]]
+            topk_length.copy_((sorted_indices >= 0).sum(dim=-1, dtype=torch.int32).masked_fill(~valid, 0))
+            if query.shape[0] != metadata.smla_topk_length.shape[0]:
+                # Eager and piecewise execution trim graph-padding query rows.
+                cu_seqlens_q = cu_seqlens_q.clamp(max=query.shape[0])
+            plan = build_smla_metadata(
+                metadata,
+                metadata.smla_metadata,
+                query.shape[1],
+                query.shape[2],
+                sorted_indices.shape[-1],
+                cu_seqlens_q,
+                topk_length,
+                hif8=hif8,
+            )
         # SFA supplies its own sparse mask. The DSA adapter strips decode indices.
         attention_op, _ = _get_sparse_flash_mla_ops()
         quant_kwargs = {}
@@ -283,11 +297,7 @@ def _hif8_quantize(x: torch.Tensor, scale_reciprocal: torch.Tensor) -> torch.Ten
 
 
 class SparseMLAMetadataState:
-    """Persistent operator buffers for NoPE within the shared SFA builder.
-
-    Sparse MLA fills lengths and the plan after receiving selected indices.
-    Pool construction and scoring remain outside operator dispatch.
-    """
+    """Persistent operator buffers for NoPE within the shared SFA builder."""
 
     def __init__(self, kv_cache_spec, vllm_config, device, kernel_block_size: int, num_heads=None):
         block_size = kv_cache_spec.block_size
@@ -317,9 +327,15 @@ class SparseMLAMetadataState:
                 if num_heads is None
                 else num_heads
             )
-            hif8 = getattr(kv_cache_spec, "cache_sparse_sfa_hif8", False)
+            self.head_dim = config.kv_lora_rank
+            self.use_position_plan = getattr(config, "index_kpool", None) is not None
+            self.reuse_draft_indices = (
+                bool(getattr(config, "index_share_for_mtp_iteration", False))
+                and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            )
+            self.hif8 = getattr(kv_cache_spec, "cache_sparse_sfa_hif8", False)
             self.metadata_buffer = torch.empty(
-                SMLA_QUANT_METADATA_SIZE if hif8 else SMLA_METADATA_SIZE,
+                SMLA_QUANT_METADATA_SIZE if self.hif8 else SMLA_METADATA_SIZE,
                 dtype=torch.int32,
                 device=device,
             )
@@ -341,7 +357,7 @@ class SparseMLAMetadataState:
                 device=device,
             )
 
-    def prepare(self, metadata):
+    def prepare(self, metadata, indexer=None, draft_index=None):
         expanded = metadata.block_table
         if expanded.shape[1] % self.split:
             raise ValueError("Sparse MLA received a partially expanded SFA block table.")
@@ -367,6 +383,24 @@ class SparseMLAMetadataState:
             metadata.smla_topk_length = self.length_buffer[: positions.numel()]
             metadata.smla_metadata = self.metadata_buffer
             metadata.smla_sinks = self.sinks
+            metadata.smla_plan_prebuilt = False
+            if indexer is not None and self.use_position_plan and not self.hif8:
+                source_positions = positions
+                if draft_index and self.reuse_draft_indices:
+                    source_positions = positions - draft_index
+                lengths = indexer.get_topk_lengths(source_positions).reshape(-1, 1)
+                metadata.smla_topk_length.copy_(lengths)
+                metadata.smla_topk_length.masked_fill_(~mask, 0)
+                metadata.smla_metadata = build_smla_metadata(
+                    metadata,
+                    self.metadata_buffer,
+                    self.num_heads,
+                    self.head_dim,
+                    indexer.topk_output_width,
+                    metadata.query_start_loc,
+                    metadata.smla_topk_length,
+                )
+                metadata.smla_plan_prebuilt = True
         return metadata
 
 
@@ -553,6 +587,7 @@ class AscendSFAMetadata:
     smla_topk_length: torch.Tensor | None = None
     smla_valid_mask: torch.Tensor | None = None
     smla_sinks: torch.Tensor | None = None
+    smla_plan_prebuilt: bool = False
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -623,6 +658,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         layer = vllm_config.compilation_config.static_forward_context[layer_names[0]]
         self.nope = layer.qk_rope_head_dim == 0
         self.use_rope = not getattr(vllm_config.model_config.hf_text_config, "mla_use_nope", False)
+        self.smla_indexer = getattr(getattr(layer, "impl", None), "indexer", None)
         self.nope_states: dict[int | None, SparseMLAMetadataState] = {}
 
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
@@ -672,7 +708,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # common_prefix_len / fast_build are unused; kept for API compatibility.
         metadata = self._build_with_metadata_view(
             common_attn_metadata,
-            lambda: self._build(common_attn_metadata, draft_index=None, pcp_context=common_attn_metadata.pcp_context),
+            lambda: self._build(
+                common_attn_metadata,
+                draft_index=getattr(common_attn_metadata, "copy_sfa_draft_index", None),
+                pcp_context=common_attn_metadata.pcp_context,
+            ),
         )
         if (
             self.use_pcp
@@ -803,7 +843,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self.nope_states[draft_index] = SparseMLAMetadataState(
                 self.kv_cache_spec, self.vllm_config, self.device, self.kernel_block_size
             )
-        self.nope_states[draft_index].prepare(metadata)
+        self.nope_states[draft_index].prepare(metadata, self.smla_indexer, draft_index)
 
     def build_for_cudagraph_capture(
         self,
@@ -1857,6 +1897,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.topk_indices_buffer is None:
             raise RuntimeError("IndexCache requires topk_indices_buffer when skip_topk is enabled.")
         topk_indices = self.topk_indices_buffer[:num_tokens]
+        if self.has_indexer:
+            topk_indices = topk_indices[:, : self.indexer.topk_output_width]
         if topk_indices.dim() == 2:
             topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
